@@ -16,6 +16,11 @@ export const createProxy = async (payload: Partial<Proxy>) => {
   return data
 }
 
+export const updateProxy = async (id: string, payload: Partial<Proxy>) => {
+  const { data } = await api.patch<Proxy>(`/api/proxies/${id}`, payload)
+  return data
+}
+
 export const deleteProxy = async (id: string) => api.delete(`/api/proxies/${id}`)
 
 export const testProxy = async (id: string) => {
@@ -34,4 +39,3 @@ export const fetchProxiesFromFreeList = async () => {
   const { data } = await api.post('/api/proxies/fetch-from-free-list')
   return data
 }
-

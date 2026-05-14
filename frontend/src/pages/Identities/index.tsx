@@ -1,23 +1,12 @@
 import { useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { getProxies } from '../../api/proxies'
+import { getProxies, updateProxy } from '../../api/proxies'
+import { getEmails, updateEmail } from '../../api/emails'
+import { createIdentity, deleteIdentity as deleteIdentityApi } from '../../api/identities'
 import { Modal }  from '../../components/ui/Modal'
 import { Button } from '../../components/ui/Button'
 import { format } from 'date-fns'
-import type { IdentityStatus, Proxy } from '../../types'
-
-// ─── Local email type (mirrors Emails page localStorage schema) ───────────────
-
-interface EmailAccount {
-  id: string
-  type: string
-  provider: string
-  address: string
-  created_at: string
-  used_by_bot_id: string | null
-  ever_blocked: boolean
-  blocked_on_platforms: string[]
-}
+import type { EmailAccount, IdentityStatus, Proxy } from '../../types'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -173,7 +162,16 @@ function flag(cc: string) {
 function hexSeed(len = 16) {
   return Array.from({ length: len }, () => Math.floor(Math.random() * 16).toString(16)).join('')
 }
-function genId() { return Math.random().toString(36).slice(2, 9) + Date.now().toString(36) }
+function genId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0
+    const v = c === 'x' ? r : (r & 0x3 | 0x8)
+    return v.toString(16)
+  })
+}
 
 function genPassword(): string {
   const a = pick(PW_ADJ), n = pick(PW_NOUN), s = pick(PW_SPEC), num = randInt(10, 9999)
@@ -316,10 +314,6 @@ function loadIdentities(): RichIdentity[] {
 }
 function saveIdentities(ids: RichIdentity[]) { localStorage.setItem(IDENTITIES_KEY, JSON.stringify(ids)) }
 
-function loadEmailAccounts(): EmailAccount[] {
-  try { return JSON.parse(localStorage.getItem('email_accounts') ?? '[]') } catch { return [] }
-}
-function saveEmailAccounts(a: EmailAccount[]) { localStorage.setItem('email_accounts', JSON.stringify(a)) }
 
 // ─── UI helpers ───────────────────────────────────────────────────────────────
 
@@ -368,7 +362,7 @@ function GenerateModal({
   emailAccounts: EmailAccount[]
   usedProxyIds: string[]
   usedEmailIds: string[]
-  onGenerate: (country: string) => void
+  onGenerate: (country: string) => void | Promise<void>
   onClose: () => void
 }) {
   const [country, setCountry]   = useState('')
@@ -593,21 +587,24 @@ function IdentityDetailModal({ identity: id, onClose }: { identity: RichIdentity
 
 export default function IdentitiesPage() {
   const [identities, setIdentities]       = useState<RichIdentity[]>(loadIdentities)
-  const [emailAccounts, setEmailAccounts] = useState<EmailAccount[]>(loadEmailAccounts)
   const [showGenerate, setShowGenerate]   = useState(false)
   const [preview, setPreview]             = useState<RichIdentity | null>(null)
 
-  const { data: proxies = [], isLoading: proxiesLoading } = useQuery({
+  const { data: proxies = [], isLoading: proxiesLoading, refetch: refetchProxies } = useQuery({
     queryKey: ['proxies'],
     queryFn: () => getProxies(),
     refetchInterval: 15000,
+  })
+  const { data: emailAccounts = [], refetch: refetchEmails } = useQuery({
+    queryKey: ['emails'],
+    queryFn: () => getEmails(),
   })
 
   // IDs already committed to existing identities
   const usedProxyIds = identities.flatMap(i => i.proxy_ids ?? [])
   const usedEmailIds = identities.map(i => i.email_id).filter(Boolean)
 
-  function handleGenerate(requestedCountry: string) {
+  async function handleGenerate(requestedCountry: string) {
     const freeProxies = proxies.filter(p =>
       p.is_healthy && !p.assigned_bot_id && !usedProxyIds.includes(p.id)
     )
@@ -617,8 +614,7 @@ export default function IdentitiesPage() {
 
     const { cc, proxies: chosenProxies } = proxyResult
 
-    const freshEmails = loadEmailAccounts() // re-read in case Emails page updated
-    const freeEmails = freshEmails.filter(e =>
+    const freeEmails = emailAccounts.filter(e =>
       !e.used_by_bot_id &&
       !usedEmailIds.includes(e.id) &&
       !e.blocked_on_platforms.includes(IDENTITY_PLATFORM_LABEL)
@@ -627,14 +623,39 @@ export default function IdentitiesPage() {
 
     const chosenEmail = pick(freeEmails)
 
-    const identity = generateIdentityData(cc, chosenEmail, chosenProxies)
+    const draftIdentity = generateIdentityData(cc, chosenEmail, chosenProxies)
+
+    // Persist identity in backend DB first.
+    const created = await createIdentity({
+      display_name: draftIdentity.display_name,
+      username: draftIdentity.username,
+      email: draftIdentity.email,
+      email_provider: draftIdentity.email.split('@')[1] ?? 'unknown',
+      email_password: null,
+      phone_number: null,
+      phone_provider: null,
+      profile_photo_url: null,
+      bio: null,
+      location: draftIdentity.country_code,
+      age: draftIdentity.age,
+      interests: draftIdentity.habits.topics_of_interest,
+      browser_profile_id: `bp_${draftIdentity.id.slice(0, 8)}`,
+      browser_profile_provider: 'custom',
+      password: draftIdentity.password,
+    })
+    const identity: RichIdentity = {
+      ...draftIdentity,
+      id: created.id,
+      created_at: created.created_at,
+    }
+
+    // Mark proxies as in use by this identity
+    await Promise.all(chosenProxies.map((p) => updateProxy(p.id, { assigned_bot_id: identity.id })))
+    await refetchProxies()
 
     // Mark email as in use
-    const updatedEmails = freshEmails.map(e =>
-      e.id === chosenEmail.id ? { ...e, used_by_bot_id: identity.id } : e
-    )
-    saveEmailAccounts(updatedEmails)
-    setEmailAccounts(updatedEmails)
+    await updateEmail(chosenEmail.id, { used_by_bot_id: identity.id })
+    await refetchEmails()
 
     const updatedIdentities = [identity, ...identities]
     setIdentities(updatedIdentities)
@@ -642,19 +663,26 @@ export default function IdentitiesPage() {
     setShowGenerate(false)
   }
 
-  function deleteIdentity(id: string) {
+  async function deleteIdentity(id: string) {
     const identity = identities.find(i => i.id === id)
+
+    // Free proxies assigned to this identity
+    if (identity?.proxy_ids?.length) {
+      await Promise.all(identity.proxy_ids.map((proxyId) => updateProxy(proxyId, { assigned_bot_id: null })))
+      await refetchProxies()
+    }
 
     // Free email if it was assigned to this identity
     if (identity?.email_id) {
-      const updatedEmails = loadEmailAccounts().map(e =>
-        e.id === identity.email_id && e.used_by_bot_id === id
-          ? { ...e, used_by_bot_id: null }
-          : e
-      )
-      saveEmailAccounts(updatedEmails)
-      setEmailAccounts(updatedEmails)
+      const assignedEmail = emailAccounts.find(e => e.id === identity.email_id && e.used_by_bot_id === id)
+      if (assignedEmail) {
+        await updateEmail(assignedEmail.id, { used_by_bot_id: null })
+        await refetchEmails()
+      }
     }
+
+    // Remove identity from backend DB.
+    await deleteIdentityApi(id)
 
     const updated = identities.filter(i => i.id !== id)
     setIdentities(updated)
@@ -785,4 +813,6 @@ export default function IdentitiesPage() {
     </div>
   )
 }
+
+
 
