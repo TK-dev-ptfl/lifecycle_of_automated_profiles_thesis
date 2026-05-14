@@ -1,0 +1,31 @@
+# Normalize line endings to LF on commit, check out as-is
+* text=auto eol=lf
+
+# Force CRLF for Windows-specific scripts
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Treat these as binary to avoid diffs on generated lockfiles
+package-lock.json binary
+yarn.lock binary
+
+# Mark images and other binaries
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg text eol=lf
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.pdf binary
+
+# Python
+*.py text eol=lf
+*.pyi text eol=lf
+
+# Shell
+*.sh text eol=lf
