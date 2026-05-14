@@ -28,7 +28,10 @@ async def generate_identity(db: AsyncSession = Depends(get_db), _: str = Depends
 
 @router.post("", response_model=IdentityResponse, status_code=201)
 async def create_identity(data: IdentityCreate, db: AsyncSession = Depends(get_db), _: str = Depends(get_current_user)):
-    return await identity_service.create_identity(db, data)
+    try:
+        return await identity_service.create_identity(db, data)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.get("/{identity_id}", response_model=IdentityResponse)

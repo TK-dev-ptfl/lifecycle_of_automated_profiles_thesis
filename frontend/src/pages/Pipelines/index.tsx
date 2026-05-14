@@ -1,9 +1,24 @@
 import { useState, useEffect } from 'react'
+
 import { useQuery } from '@tanstack/react-query'
-import { getBots } from '../../api/bots'
+import { getBots, updateBot } from '../../api/bots'
 import { createEmail, getEmailPlatforms } from '../../api/emails'
 import { Button } from '../../components/ui/Button'
 import type { Bot } from '../../types'
+
+function saveProgress(p: ProgressMap) { localStorage.setItem('pipeline_progress_v2', JSON.stringify(p)) }
+
+async function syncBotPipelineState(botId: string, inPipeline: boolean) {
+  try {
+    if (inPipeline) {
+      await updateBot(botId, { state: 'in_pipeline', status: 'running' } as Partial<Bot>)
+      return
+    }
+    await updateBot(botId, { state: 'not_active', status: 'stopped' } as Partial<Bot>)
+  } catch {
+    // Keep UI flow working even if state sync fails.
+  }
+}
 
 // ─── Data model ───────────────────────────────────────────────────────────────
 
@@ -641,7 +656,7 @@ type ProgressMap = Record<string, BotProgress>
 function loadProgress(): ProgressMap {
   try { return JSON.parse(localStorage.getItem('pipeline_progress_v2') ?? '{}') } catch { return {} }
 }
-function saveProgress(p: ProgressMap) { localStorage.setItem('pipeline_progress_v2', JSON.stringify(p)) }
+
 
 function uid() {
   return Math.random().toString(36).slice(2, 10)
@@ -1485,6 +1500,7 @@ export default function PipelinesPage() {
       ...prev,
       [botId]: { pipelineId: redditPipeline.id, currentStep: 0, completedSteps: [], manualInputs: {} },
     }))
+    void syncBotPipelineState(botId, true)
   }
 
   const addEmailRun = async (runId: string) => {
@@ -1525,6 +1541,14 @@ export default function PipelinesPage() {
   }
 
   const advanceBot = (botId: string, inputs: Record<string, string>) => {
+    const current = progress[botId]
+    if (current) {
+      const nextStep = current.currentStep + 1
+      const pipeline = PIPELINES.find(p => p.id === current.pipelineId)
+      const done = !!pipeline && nextStep >= pipeline.steps.length
+      void syncBotPipelineState(botId, !done)
+    }
+
     setProgress(prev => {
       const p = prev[botId]
       if (!p) return prev
@@ -1563,6 +1587,7 @@ export default function PipelinesPage() {
   }
 
   const removeBot = (botId: string) => {
+    void syncBotPipelineState(botId, false)
     setProgress(prev => { const next = { ...prev }; delete next[botId]; return next })
   }
 
@@ -1767,6 +1792,10 @@ export default function PipelinesPage() {
     </div>
   )
 }
+
+
+
+
 
 
 

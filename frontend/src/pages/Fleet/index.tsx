@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { getBots, runBot, pauseBot, stopBot, deleteBot, createBot } from '../../api/bots'
+import { getBots, pauseBot, stopBot, deleteBot, createBot, updateBot } from '../../api/bots'
 import { getIdentities } from '../../api/identities'
 import { getTasks } from '../../api/tasks'
 import { DataTable, Column } from '../../components/ui/DataTable'
@@ -26,6 +26,9 @@ interface LocalIdentity {
 
 function deriveOpMode(bot: Bot): OpMode {
   if (bot.status === 'flagged' || bot.status === 'banned') return 'blocked'
+  if (bot.state === 'in_pipeline') return 'in_pipeline'
+  if (bot.state === 'in_task') return 'running_task'
+  if (bot.state === 'blocked') return 'blocked'
   if (bot.status === 'running' && bot.task_id) return 'running_task'
   if (bot.status === 'running') return 'in_pipeline'
   return 'not_running'
@@ -119,12 +122,25 @@ export default function FleetPage() {
     emailAccounts.filter((e: any) => e.used_by_bot_id).map((e: any) => [e.used_by_bot_id, e])
   )
 
-  const run   = useMutation({ mutationFn: runBot,   onSuccess: () => qc.invalidateQueries({ queryKey: ['bots'] }) })
   const pause = useMutation({ mutationFn: pauseBot, onSuccess: () => qc.invalidateQueries({ queryKey: ['bots'] }) })
   const stop  = useMutation({ mutationFn: stopBot,  onSuccess: () => qc.invalidateQueries({ queryKey: ['bots'] }) })
   const del   = useMutation({ mutationFn: deleteBot, onSuccess: () => qc.invalidateQueries({ queryKey: ['bots'] }) })
   const create = useMutation({
-    mutationFn: createBot,
+    mutationFn: async (payload: Partial<Bot>) => {
+      const created = await createBot(payload)
+      await updateBot(created.id, { state: 'in_pipeline', status: 'running' } as Partial<Bot>)
+      const existing = (() => {
+        try { return JSON.parse(localStorage.getItem('pipeline_progress_v2') || '{}') } catch { return {} }
+      })()
+      existing[created.id] = {
+        pipelineId: 'rd-creation',
+        currentStep: 0,
+        completedSteps: [],
+        manualInputs: {},
+      }
+      localStorage.setItem('pipeline_progress_v2', JSON.stringify(existing))
+      return created
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['bots'] })
       setShowCreate(false)
@@ -212,9 +228,6 @@ export default function FleetPage() {
       key: 'actions', header: '',
       render: (b) => (
         <div className="flex items-center gap-1">
-          {b.status !== 'running' && (
-            <Button size="sm" variant="success" onClick={(e) => { e.stopPropagation(); run.mutate(b.id) }}>Run</Button>
-          )}
           {b.status === 'running' && (
             <Button size="sm" variant="secondary" onClick={(e) => { e.stopPropagation(); pause.mutate(b.id) }}>Pause</Button>
           )}
@@ -281,7 +294,6 @@ export default function FleetPage() {
           {selected.length > 0 && (
             <div className="flex gap-2 items-center">
               <span className="text-xs text-gray-500">{selected.length} selected</span>
-              <Button size="sm" variant="success" onClick={() => selected.forEach(id => run.mutate(id))}>Run All</Button>
               <Button size="sm" variant="secondary" onClick={() => selected.forEach(id => pause.mutate(id))}>Pause All</Button>
               <Button size="sm" variant="danger" onClick={() => selected.forEach(id => del.mutate(id))}>Delete</Button>
             </div>

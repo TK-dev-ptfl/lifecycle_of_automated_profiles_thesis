@@ -2,11 +2,11 @@ import { useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getProxies, updateProxy } from '../../api/proxies'
 import { getEmails, updateEmail } from '../../api/emails'
-import { createIdentity, deleteIdentity as deleteIdentityApi } from '../../api/identities'
+import { createIdentity, deleteIdentity as deleteIdentityApi, getIdentities } from '../../api/identities'
 import { Modal }  from '../../components/ui/Modal'
 import { Button } from '../../components/ui/Button'
 import { format } from 'date-fns'
-import type { EmailAccount, IdentityStatus, Proxy } from '../../types'
+import type { EmailAccount, Identity, IdentityStatus, Proxy } from '../../types'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -183,6 +183,15 @@ function genPassword(): string {
   ])
 }
 
+function seedFromString(input: string): number {
+  let h = 2166136261
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return Math.abs(h >>> 0)
+}
+
 // ─── Proxy selection ──────────────────────────────────────────────────────────
 
 function selectProxies(
@@ -305,14 +314,75 @@ function generateIdentityData(cc: string, email: EmailAccount, proxies: Proxy[])
   }
 }
 
-// ─── localStorage ─────────────────────────────────────────────────────────────
+function hydrateIdentity(dbIdentity: Identity, proxies: Proxy[], emailAccounts: EmailAccount[]): RichIdentity {
+  const cc = (dbIdentity.location || 'US').toUpperCase()
+  const country = COUNTRIES[cc] ?? COUNTRIES.US
+  const [firstName = dbIdentity.display_name, ...rest] = dbIdentity.display_name.split(' ')
+  const lastName = rest.join(' ') || 'Unknown'
+  const seed = seedFromString(`${dbIdentity.id}:${dbIdentity.username}:${dbIdentity.email}`)
+  const hw = HW_COMBOS[seed % HW_COMBOS.length]
+  const bv = hw.bvMin + (seed % (hw.bvMax - hw.bvMin + 1))
+  const [sw, sh] = SCREENS[seed % SCREENS.length]
+  const [wv, wr] = WEBGL[seed % WEBGL.length]
+  const browser = hw.browser
+  const browserVersion = String(bv)
+  const userAgent = buildUA(hw.os, hw.browser, bv)
+  const attachedProxies = proxies.filter((p) => p.assigned_bot_id === dbIdentity.id)
+  const linkedEmail = emailAccounts.find((e) => e.address === dbIdentity.email)
 
-const IDENTITIES_KEY = 'rich_identities'
-
-function loadIdentities(): RichIdentity[] {
-  try { return JSON.parse(localStorage.getItem(IDENTITIES_KEY) ?? '[]') } catch { return [] }
+  return {
+    id: dbIdentity.id,
+    first_name: firstName,
+    last_name: lastName,
+    display_name: dbIdentity.display_name,
+    username: dbIdentity.username,
+    date_of_birth: `${new Date().getFullYear() - dbIdentity.age}-01-01`,
+    age: dbIdentity.age,
+    country: country.name,
+    country_code: cc,
+    city: country.cities[0] ?? 'Unknown',
+    languages: country.languages,
+    timezone: country.timezone,
+    timezone_offset: country.tz_offset,
+    email: dbIdentity.email,
+    email_id: linkedEmail?.id ?? '',
+    password: '••••••••',
+    proxy_ids: attachedProxies.map((p) => p.id),
+    proxy_details: attachedProxies.map((p) => ({
+      id: p.id, host: p.host, port: p.port, country: p.country, type: p.type, protocol: p.protocol,
+    })),
+    hardware: {
+      os: hw.os,
+      os_version: hw.os_v,
+      browser,
+      browser_version: browserVersion,
+      user_agent: userAgent,
+      screen_width: sw,
+      screen_height: sh,
+      color_depth: 24,
+      pixel_ratio: 1,
+      device_memory: 8,
+      hardware_concurrency: 8,
+      webgl_vendor: wv,
+      webgl_renderer: wr,
+      canvas_seed: hexSeed(16),
+    },
+    habits: {
+      scrolling_speed: 'medium',
+      typing_speed: 'medium',
+      speech_patterns: [],
+      topics_of_interest: dbIdentity.interests ?? [],
+      active_hours_start: 8,
+      active_hours_end: 22,
+      session_duration_min: 10,
+      session_duration_max: 30,
+      posts_per_day: 3,
+      like_ratio: 0.5,
+    },
+    status: dbIdentity.status,
+    created_at: dbIdentity.created_at,
+  }
 }
-function saveIdentities(ids: RichIdentity[]) { localStorage.setItem(IDENTITIES_KEY, JSON.stringify(ids)) }
 
 
 // ─── UI helpers ───────────────────────────────────────────────────────────────
@@ -586,7 +656,6 @@ function IdentityDetailModal({ identity: id, onClose }: { identity: RichIdentity
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function IdentitiesPage() {
-  const [identities, setIdentities]       = useState<RichIdentity[]>(loadIdentities)
   const [showGenerate, setShowGenerate]   = useState(false)
   const [preview, setPreview]             = useState<RichIdentity | null>(null)
 
@@ -599,6 +668,12 @@ export default function IdentitiesPage() {
     queryKey: ['emails'],
     queryFn: () => getEmails(),
   })
+  const { data: identitiesDb = [], refetch: refetchIdentities } = useQuery({
+    queryKey: ['identities'],
+    queryFn: () => getIdentities(),
+  })
+
+  const identities: RichIdentity[] = identitiesDb.map((i) => hydrateIdentity(i, proxies, emailAccounts))
 
   // IDs already committed to existing identities
   const usedProxyIds = identities.flatMap(i => i.proxy_ids ?? [])
@@ -657,10 +732,8 @@ export default function IdentitiesPage() {
     await updateEmail(chosenEmail.id, { used_by_bot_id: identity.id })
     await refetchEmails()
 
-    const updatedIdentities = [identity, ...identities]
-    setIdentities(updatedIdentities)
-    saveIdentities(updatedIdentities)
     setShowGenerate(false)
+    await refetchIdentities()
   }
 
   async function deleteIdentity(id: string) {
@@ -681,9 +754,7 @@ export default function IdentitiesPage() {
     // Remove identity from backend DB.
     await deleteIdentityApi(id)
 
-    const updated = identities.filter(i => i.id !== id)
-    setIdentities(updated)
-    saveIdentities(updated)
+    await refetchIdentities()
   }
 
   const stats = [

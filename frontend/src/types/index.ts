@@ -1,5 +1,6 @@
 export type BotStatus = 'running' | 'paused' | 'stopped' | 'flagged' | 'banned'
 export type BotMode = 'growing' | 'trust' | 'executing' | 'maintaining'
+export type BotState = 'in_pipeline' | 'in_task' | 'not_active' | 'blocked'
 export type CommunicationMode = 'official_api' | 'unofficial_api' | 'scraping' | 'human_emulation'
 export type BehaviourPattern = 'passive' | 'reactive' | 'proactive' | 'aggressive'
 export type IdentityStatus = 'fresh' | 'active' | 'flagged' | 'burned'
@@ -66,6 +67,7 @@ export interface Bot {
   skeleton: string
   mode: BotMode
   status: BotStatus
+  state?: BotState
   communication_mode: CommunicationMode
   behaviour_pattern: BehaviourPattern
   parameters: Record<string, unknown>

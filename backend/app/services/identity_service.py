@@ -5,7 +5,11 @@ from typing import Optional
 from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 from app.models.identity import Identity, IdentityStatus
+from app.models.bot import Bot, BotStatus, BotState
+from app.models.email import Email
+from app.models.proxy import Proxy
 from app.schemas.identity import IdentityCreate, IdentityUpdate
 from app.auth.utils import hash_password
 
@@ -30,10 +34,22 @@ async def get_identity(db: AsyncSession, identity_id: UUID) -> Optional[Identity
 
 
 async def create_identity(db: AsyncSession, data: IdentityCreate) -> Identity:
+    existing_email = await db.execute(select(Identity.id).where(Identity.email == data.email))
+    if existing_email.scalar_one_or_none() is not None:
+        raise ValueError(f"Identity with email '{data.email}' already exists")
+
+    existing_username = await db.execute(select(Identity.id).where(Identity.username == data.username))
+    if existing_username.scalar_one_or_none() is not None:
+        raise ValueError(f"Identity with username '{data.username}' already exists")
+
     hashed = hash_password(data.password)
     identity = Identity(**{**data.model_dump(exclude={"password"}), "password_hash": hashed})
     db.add(identity)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise ValueError("Identity with the same email or username already exists")
     await db.refresh(identity)
     return identity
 
@@ -52,6 +68,33 @@ async def delete_identity(db: AsyncSession, identity_id: UUID) -> bool:
     identity = await get_identity(db, identity_id)
     if not identity:
         return False
+
+    bots_result = await db.execute(select(Bot).where(Bot.identity_id == identity_id))
+    bots = bots_result.scalars().all()
+
+    for bot in bots:
+        # Release all emails assigned to this bot.
+        emails_result = await db.execute(select(Email).where(Email.used_by_bot_id == bot.id))
+        emails = emails_result.scalars().all()
+        for email in emails:
+            email.used_by_bot_id = None
+
+        # Release proxy assignment by both relation pointers.
+        if bot.proxy_id:
+            proxy = await db.get(Proxy, bot.proxy_id)
+            if proxy:
+                proxy.assigned_bot_id = None
+            bot.proxy_id = None
+        proxy_by_bot_result = await db.execute(select(Proxy).where(Proxy.assigned_bot_id == bot.id))
+        proxies = proxy_by_bot_result.scalars().all()
+        for proxy in proxies:
+            proxy.assigned_bot_id = None
+
+        # Detach bot from identity and reset lifecycle state.
+        bot.identity_id = None
+        bot.state = BotState.not_active
+        bot.status = BotStatus.stopped
+
     await db.delete(identity)
     return True
 
