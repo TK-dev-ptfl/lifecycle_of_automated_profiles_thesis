@@ -2,18 +2,41 @@ import { api } from './client'
 import type { Platform, FleetSummary, FleetHealthItem } from '../types'
 
 export const getPlatforms = async () => {
-  const { data } = await api.get<Platform[]>('/api/platforms')
-  return data
+  return [
+    {
+      id: 'a0000000-0000-0000-0000-000000000001',
+      name: 'reddit',
+      display_name: 'Reddit',
+      is_enabled: true,
+      rate_limits: {},
+      adapter_config: {},
+      created_at: new Date().toISOString(),
+    },
+  ] as Platform[]
 }
 
 export const createPlatform = async (payload: Partial<Platform>) => {
-  const { data } = await api.post<Platform>('/api/platforms', payload)
-  return data
+  return {
+    id: 'a0000000-0000-0000-0000-000000000001',
+    name: 'reddit',
+    display_name: 'Reddit',
+    is_enabled: true,
+    rate_limits: payload.rate_limits ?? {},
+    adapter_config: payload.adapter_config ?? {},
+    created_at: new Date().toISOString(),
+  } as Platform
 }
 
 export const updatePlatform = async (id: string, payload: Partial<Platform>) => {
-  const { data } = await api.patch<Platform>(`/api/platforms/${id}`, payload)
-  return data
+  return {
+    id: 'a0000000-0000-0000-0000-000000000001',
+    name: 'reddit',
+    display_name: 'Reddit',
+    is_enabled: payload.is_enabled ?? true,
+    rate_limits: payload.rate_limits ?? {},
+    adapter_config: payload.adapter_config ?? {},
+    created_at: new Date().toISOString(),
+  } as Platform
 }
 
 export const getFleetSummary = async () => {

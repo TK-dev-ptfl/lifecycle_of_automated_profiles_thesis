@@ -8,7 +8,7 @@ from app.models.task import TaskType, TaskStatus, SyncMode
 
 class TaskBase(BaseModel):
     name: str
-    platform_id: UUID
+    platform_id: Optional[UUID] = None
     type: TaskType
     payload: dict = {}
     schedule: dict = {}

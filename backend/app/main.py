@@ -8,7 +8,6 @@ from app.routers.bots import router as bots_router
 from app.routers.tasks import router as tasks_router
 from app.routers.identities import router as identities_router
 from app.routers.proxies import router as proxies_router
-from app.routers.platforms import router as platforms_router
 from app.routers.fleet import router as fleet_router
 from app.routers.ws import router as ws_router
 from app.routers.algorithms import router as algorithms_router
@@ -52,7 +51,6 @@ app.include_router(bots_router)
 app.include_router(tasks_router)
 app.include_router(identities_router)
 app.include_router(proxies_router)
-app.include_router(platforms_router)
 app.include_router(fleet_router)
 app.include_router(ws_router)
 app.include_router(algorithms_router)

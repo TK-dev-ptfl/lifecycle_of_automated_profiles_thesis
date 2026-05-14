@@ -1,4 +1,3 @@
-from app.models.platform import Platform
 from app.models.identity import Identity
 from app.models.proxy import Proxy
 from app.models.bot import Bot
@@ -8,4 +7,4 @@ from app.models.email_platform import EmailPlatform
 from app.models.email import Email
 from app.models.sandbox import Sandbox
 
-__all__ = ["Platform", "Identity", "Proxy", "Bot", "Task", "Log", "EmailPlatform", "Email", "Sandbox"]
+__all__ = ["Identity", "Proxy", "Bot", "Task", "Log", "EmailPlatform", "Email", "Sandbox"]

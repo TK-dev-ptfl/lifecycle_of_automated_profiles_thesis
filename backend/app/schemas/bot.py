@@ -21,7 +21,7 @@ class BotParameters(BaseModel):
 
 class BotBase(BaseModel):
     name: str
-    platform_id: UUID
+    platform_id: Optional[UUID] = None
     identity_value: Optional[str] = None
     profile_name: Optional[str] = None
     profile_password: Optional[str] = None

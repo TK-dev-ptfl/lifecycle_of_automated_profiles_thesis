@@ -8,24 +8,27 @@ from app.models.task import Task, TaskStatus
 from app.models.bot import Bot
 from app.schemas.task import TaskCreate, TaskUpdate
 from datetime import datetime, timezone
+from app.constants import REDDIT_PLATFORM_ID
 
 
 async def get_tasks(db: AsyncSession) -> list:
-    q = select(Task).options(selectinload(Task.platform), selectinload(Task.bots))
+    q = select(Task).options(selectinload(Task.bots))
     result = await db.execute(q)
     return result.scalars().all()
 
 
 async def get_task(db: AsyncSession, task_id: UUID) -> Optional[Task]:
     q = select(Task).where(Task.id == task_id).options(
-        selectinload(Task.platform), selectinload(Task.bots)
+        selectinload(Task.bots)
     )
     result = await db.execute(q)
     return result.scalar_one_or_none()
 
 
 async def create_task(db: AsyncSession, data: TaskCreate) -> Task:
-    task = Task(**data.model_dump())
+    payload = data.model_dump()
+    payload["platform_id"] = payload.get("platform_id") or REDDIT_PLATFORM_ID
+    task = Task(**payload)
     db.add(task)
     await db.flush()
     await db.refresh(task)

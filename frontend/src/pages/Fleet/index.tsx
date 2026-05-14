@@ -1,8 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { getBots, runBot, pauseBot, stopBot, deleteBot, createBot } from '../../api/bots'
-import { getPlatforms } from '../../api/platforms'
 import { getIdentities } from '../../api/identities'
 import { getTasks } from '../../api/tasks'
 import { DataTable, Column } from '../../components/ui/DataTable'
@@ -94,15 +93,14 @@ export default function FleetPage() {
   const qc = useQueryClient()
   const [selected, setSelected] = useState<string[]>([])
   const [showCreate, setShowCreate] = useState(false)
-  const [newBot, setNewBot] = useState({ platform_id: '', identity_id: '' })
-  const [filters, setFilters] = useState({ status: '', platform_id: '' })
+  const [newBot, setNewBot] = useState({ platform_id: 'a0000000-0000-0000-0000-000000000001', identity_id: '' })
+  const [filters, setFilters] = useState({ status: '' })
 
   const { data: bots = [], isLoading } = useQuery({
     queryKey: ['bots', filters],
     queryFn: () => getBots(Object.fromEntries(Object.entries(filters).filter(([, v]) => v))),
     refetchInterval: 10000,
   })
-  const { data: platforms = [] } = useQuery({ queryKey: ['platforms'], queryFn: getPlatforms })
   const { data: identities = [] } = useQuery({ queryKey: ['identities'], queryFn: () => getIdentities() })
   const { data: tasks = [] } = useQuery({ queryKey: ['tasks'], queryFn: getTasks })
   const localIdentities: LocalIdentity[] = identities.map((i) => ({
@@ -134,12 +132,6 @@ export default function FleetPage() {
     },
   })
 
-  useEffect(() => {
-    if (!newBot.platform_id && platforms.length > 0) {
-      setNewBot((prev) => ({ ...prev, platform_id: platforms[0].id }))
-    }
-  }, [newBot.platform_id, platforms])
-
   const columns: Column<Bot>[] = [
     {
       key: 'name', header: 'Bot',
@@ -152,7 +144,7 @@ export default function FleetPage() {
             {b.name}
           </button>
           <p className="text-xs text-gray-600 mt-0.5">
-            {platforms.find(p => p.id === b.platform_id)?.display_name ?? b.platform_id}
+            Reddit
           </p>
         </div>
       ),
@@ -284,14 +276,6 @@ export default function FleetPage() {
                 <option key={s} value={s}>{s}</option>
               ))}
             </select>
-            <select
-              value={filters.platform_id}
-              onChange={(e) => setFilters(f => ({ ...f, platform_id: e.target.value }))}
-              className="rounded-lg border border-gray-600 bg-gray-800 px-3 py-1.5 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-brand-500"
-            >
-              <option value="">All Platforms</option>
-              {platforms.map(p => <option key={p.id} value={p.id}>{p.display_name}</option>)}
-            </select>
           </div>
 
           {selected.length > 0 && (
@@ -336,13 +320,7 @@ export default function FleetPage() {
         }
       >
         <div className="space-y-4">
-          <Select
-            label="Platform"
-            value={newBot.platform_id}
-            onChange={(e) => setNewBot(n => ({ ...n, platform_id: e.target.value }))}
-            options={platforms.map((p) => ({ value: p.id, label: p.display_name }))}
-            placeholder="Select platform"
-          />
+          <p className="text-sm text-gray-400">Platform: Reddit</p>
           <Select
             label="Identity"
             value={newBot.identity_id}

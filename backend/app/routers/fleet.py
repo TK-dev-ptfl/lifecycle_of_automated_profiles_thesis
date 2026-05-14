@@ -4,7 +4,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.auth.utils import get_current_user
 from app.models.bot import Bot, BotStatus, BotMode
-from app.models.platform import Platform
 
 router = APIRouter(prefix="/api/fleet", tags=["fleet"])
 

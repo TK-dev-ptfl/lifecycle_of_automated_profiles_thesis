@@ -16,12 +16,11 @@ router = APIRouter(prefix="/api/bots", tags=["bots"])
 async def list_bots(
     status: Optional[str] = Query(None),
     mode: Optional[str] = Query(None),
-    platform_id: Optional[UUID] = Query(None),
     task_id: Optional[UUID] = Query(None),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(get_current_user),
 ):
-    return await bot_service.get_bots(db, status=status, mode=mode, platform_id=platform_id, task_id=task_id)
+    return await bot_service.get_bots(db, status=status, mode=mode, task_id=task_id)
 
 
 @router.post("", response_model=BotResponse, status_code=201)

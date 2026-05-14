@@ -1,28 +1,27 @@
 from __future__ import annotations
 from typing import Optional
 from uuid import UUID
+import uuid
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from app.models.bot import Bot, BotStatus, BotMode
 from app.models.log import Log, LogLevel, LogCategory
 from app.schemas.bot import BotCreate, BotUpdate
+from app.constants import REDDIT_PLATFORM_ID, REDDIT_PLATFORM_NAME
 
 
 async def get_bots(
     db: AsyncSession,
     status: Optional[str] = None,
     mode: Optional[str] = None,
-    platform_id: Optional[UUID] = None,
     task_id: Optional[UUID] = None,
 ) -> list:
-    q = select(Bot).options(selectinload(Bot.platform), selectinload(Bot.identity), selectinload(Bot.proxy))
+    q = select(Bot).options(selectinload(Bot.identity), selectinload(Bot.proxy))
     if status:
         q = q.where(Bot.status == status)
     if mode:
         q = q.where(Bot.mode == mode)
-    if platform_id:
-        q = q.where(Bot.platform_id == platform_id)
     if task_id:
         q = q.where(Bot.task_id == task_id)
     result = await db.execute(q)
@@ -31,14 +30,21 @@ async def get_bots(
 
 async def get_bot(db: AsyncSession, bot_id: UUID) -> Optional[Bot]:
     q = select(Bot).where(Bot.id == bot_id).options(
-        selectinload(Bot.platform), selectinload(Bot.identity), selectinload(Bot.proxy)
+        selectinload(Bot.identity), selectinload(Bot.proxy)
     )
     result = await db.execute(q)
     return result.scalar_one_or_none()
 
 
 async def create_bot(db: AsyncSession, data: BotCreate) -> Bot:
-    bot = Bot(**data.model_dump())
+    payload = data.model_dump()
+    # SQLite may coerce UUID-looking numeric prefixes into integers on NUMERIC-affinity columns.
+    # Force bot id to start with a hex letter to keep it stored as text.
+    if not payload.get("id"):
+        payload["id"] = uuid.UUID("a" + uuid.uuid4().hex[1:])
+    payload["platform_id"] = payload.get("platform_id") or REDDIT_PLATFORM_ID
+    payload["platform_name"] = payload.get("platform_name") or REDDIT_PLATFORM_NAME
+    bot = Bot(**payload)
     db.add(bot)
     await db.flush()
     await db.refresh(bot)

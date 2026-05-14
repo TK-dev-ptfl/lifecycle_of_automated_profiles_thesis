@@ -37,7 +37,7 @@ class Task(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
-    platform_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("platforms.id"), nullable=False)
+    platform_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     type: Mapped[TaskType] = mapped_column(SAEnum(TaskType), nullable=False)
     status: Mapped[TaskStatus] = mapped_column(SAEnum(TaskStatus), default=TaskStatus.idle)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -51,6 +51,5 @@ class Task(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    platform: Mapped[Platform] = relationship("Platform", back_populates="tasks")
     bots: Mapped[list[Bot]] = relationship("Bot", back_populates="task")
     logs: Mapped[list[Log]] = relationship("Log", back_populates="task")

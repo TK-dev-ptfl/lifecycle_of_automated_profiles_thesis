@@ -50,7 +50,7 @@ class Bot(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
-    platform_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("platforms.id"), nullable=False)
+    platform_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     identity_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("identities.id"), nullable=True)
     identity_value: Mapped[Optional[str]] = mapped_column("identity", String(256), nullable=True)
     profile_name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
@@ -74,7 +74,6 @@ class Bot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    platform: Mapped[Platform] = relationship("Platform", back_populates="bots")
     identity: Mapped[Optional[Identity]] = relationship("Identity", back_populates="bot")
     proxy: Mapped[Optional[Proxy]] = relationship("Proxy", back_populates="bot", foreign_keys="[Proxy.assigned_bot_id]")
     task: Mapped[Optional[Task]] = relationship("Task", back_populates="bots")
