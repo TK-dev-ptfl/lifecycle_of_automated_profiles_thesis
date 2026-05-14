@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { getBots, runBot, pauseBot, stopBot, deleteBot, createBot } from '../../api/bots'
 import { getPlatforms } from '../../api/platforms'
+import { getIdentities } from '../../api/identities'
 import { getTasks } from '../../api/tasks'
 import { DataTable, Column } from '../../components/ui/DataTable'
 import { Badge } from '../../components/ui/Badge'
@@ -23,8 +24,6 @@ interface LocalIdentity {
   username: string
   password?: string
 }
-
-const REDDIT_PLATFORM_ID = 'reddit'
 
 function deriveOpMode(bot: Bot): OpMode {
   if (bot.status === 'flagged' || bot.status === 'banned') return 'blocked'
@@ -95,7 +94,7 @@ export default function FleetPage() {
   const qc = useQueryClient()
   const [selected, setSelected] = useState<string[]>([])
   const [showCreate, setShowCreate] = useState(false)
-  const [newBot, setNewBot] = useState({ platform_id: REDDIT_PLATFORM_ID, identity_id: '' })
+  const [newBot, setNewBot] = useState({ platform_id: '', identity_id: '' })
   const [filters, setFilters] = useState({ status: '', platform_id: '' })
 
   const { data: bots = [], isLoading } = useQuery({
@@ -104,10 +103,13 @@ export default function FleetPage() {
     refetchInterval: 10000,
   })
   const { data: platforms = [] } = useQuery({ queryKey: ['platforms'], queryFn: getPlatforms })
+  const { data: identities = [] } = useQuery({ queryKey: ['identities'], queryFn: () => getIdentities() })
   const { data: tasks = [] } = useQuery({ queryKey: ['tasks'], queryFn: getTasks })
-  const localIdentities: LocalIdentity[] = (() => {
-    try { return JSON.parse(localStorage.getItem('rich_identities') || '[]') } catch { return [] }
-  })()
+  const localIdentities: LocalIdentity[] = identities.map((i) => ({
+    id: i.id,
+    display_name: i.display_name,
+    username: i.username,
+  }))
 
   const taskMap: Record<string, Task> = Object.fromEntries(tasks.map(t => [t.id, t]))
 
@@ -128,9 +130,15 @@ export default function FleetPage() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['bots'] })
       setShowCreate(false)
-      setNewBot({ platform_id: REDDIT_PLATFORM_ID, identity_id: '' })
+      setNewBot((prev) => ({ ...prev, identity_id: '' }))
     },
   })
+
+  useEffect(() => {
+    if (!newBot.platform_id && platforms.length > 0) {
+      setNewBot((prev) => ({ ...prev, platform_id: platforms[0].id }))
+    }
+  }, [newBot.platform_id, platforms])
 
   const columns: Column<Bot>[] = [
     {
@@ -319,7 +327,7 @@ export default function FleetPage() {
             <Button variant="ghost" onClick={() => setShowCreate(false)}>Cancel</Button>
               <Button
               loading={create.isPending}
-              disabled={!newBot.identity_id}
+              disabled={!newBot.identity_id || !newBot.platform_id}
               onClick={createFromSelection}
             >
               Create
@@ -331,9 +339,9 @@ export default function FleetPage() {
           <Select
             label="Platform"
             value={newBot.platform_id}
-            onChange={() => {}}
-            options={[{ value: REDDIT_PLATFORM_ID, label: 'Reddit' }]}
-            disabled
+            onChange={(e) => setNewBot(n => ({ ...n, platform_id: e.target.value }))}
+            options={platforms.map((p) => ({ value: p.id, label: p.display_name }))}
+            placeholder="Select platform"
           />
           <Select
             label="Identity"

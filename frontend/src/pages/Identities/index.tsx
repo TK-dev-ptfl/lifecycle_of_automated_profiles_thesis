@@ -674,11 +674,8 @@ export default function IdentitiesPage() {
 
     // Free email if it was assigned to this identity
     if (identity?.email_id) {
-      const assignedEmail = emailAccounts.find(e => e.id === identity.email_id && e.used_by_bot_id === id)
-      if (assignedEmail) {
-        await updateEmail(assignedEmail.id, { used_by_bot_id: null })
-        await refetchEmails()
-      }
+      await updateEmail(identity.email_id, { used_by_bot_id: null })
+      await refetchEmails()
     }
 
     // Remove identity from backend DB.
