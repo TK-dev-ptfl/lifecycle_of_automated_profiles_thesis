@@ -282,6 +282,7 @@ async def start_email_pipeline_for_identity(
         async with AsyncSessionLocal() as db:
             identity_for_name = await db.get(Identity, identity_id)
             display_name = identity_for_name.display_name if identity_for_name else None
+            identity_age = identity_for_name.age if identity_for_name else None
             proxy = await _select_and_test_proxy(db, identity_id)
 
         if proxy is None:
@@ -304,6 +305,7 @@ async def start_email_pipeline_for_identity(
                 wait_for_manual=wait_for_manual,
                 proxy=proxy_config,
                 display_name=display_name,
+                age=identity_age,
             )
         except Exception:
             pipeline_progress.finish(identity_id, error="pipeline failed - see server logs")

@@ -25,6 +25,7 @@ import secrets
 import string
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Awaitable, Callable, Optional, TypedDict
 
 from playwright.async_api import BrowserContext, Page, async_playwright
@@ -57,16 +58,59 @@ def generate_username(prefix: str = "bot") -> str:
     return f"{prefix}{secrets.token_hex(4)}"
 
 
-def generate_username_from_display_name(display_name: str) -> str:
-    """Turns e.g. 'Zuzana Kovac' into something like 'zuzanakovac482' -
-    a plausible human handle instead of a random hex string. Falls back to
-    generate_username() if the name yields nothing usable (empty/symbols-only)."""
+def _name_parts(display_name: str) -> list[str]:
     ascii_only = unicodedata.normalize("NFKD", display_name).encode("ascii", "ignore").decode("ascii")
-    base = re.sub(r"[^a-z0-9]", "", ascii_only.lower())
-    if not base:
+    return [p for p in (re.sub(r"[^a-z0-9]", "", w.lower()) for w in ascii_only.split()) if p]
+
+
+def generate_username_from_identity(display_name: str, age: Optional[int] = None) -> str:
+    """Real people don't all pick 'name + 3 random digits' - some use their
+    birth year, some just initials, some no number at all. Picks one of
+    several realistic patterns each time instead of always the same shape,
+    so a whole fleet of these doesn't look like a template was run through a
+    counter. Falls back to generate_username() if the name yields nothing
+    usable (empty/symbols-only)."""
+    parts = _name_parts(display_name)
+    if not parts:
         return generate_username()
-    suffix = secrets.randbelow(900) + 100
-    return f"{base}{suffix}"[:20]
+
+    first = parts[0]
+    last = parts[1] if len(parts) > 1 else ""
+    sep = random.choice(["", "", "", ".", "_"])  # no separator is the common case
+
+    if last:
+        pattern = random.choice([
+            "first_last", "last_first", "first_initial_last", "first_last_initial", "first_only",
+        ])
+    else:
+        pattern = "first_only"
+
+    if pattern == "first_last":
+        core = f"{first}{sep}{last}"
+    elif pattern == "last_first":
+        core = f"{last}{sep}{first}"
+    elif pattern == "first_initial_last":
+        core = f"{first[0]}{sep}{last}"
+    elif pattern == "first_last_initial":
+        core = f"{first}{sep}{last[0]}"
+    else:
+        core = first
+
+    # Numeric suffix: a birth year (full or 2-digit) derived from the
+    # identity's actual age when we have one, a small random number, or
+    # nothing at all - varying which, instead of a uniform 3-digit code
+    # every time, is what actually reads as human.
+    suffix = ""
+    roll = random.random()
+    if age is not None and roll < 0.45:
+        birth_year = date.today().year - age - random.randint(0, 1)
+        suffix = str(birth_year) if random.random() < 0.5 else f"{birth_year % 100:02d}"
+    elif roll < 0.75:
+        suffix = str(random.randint(1, 999))
+    # else: no numeric suffix at all
+
+    username = re.sub(r"[^a-z0-9._]", "", f"{core}{suffix}".lower()).strip("._")
+    return username[:20] or generate_username()
 
 
 def generate_password(length: int = 20) -> str:
@@ -109,10 +153,19 @@ class TutaSignupContext:
     page: Optional[Page] = None
     log: list[str] = field(default_factory=list)
     wait_for_manual: Callable[[str], Awaitable[None]] = _wait_via_stdin
+    # Kept so step_fill_credentials can generate a fresh candidate in the same
+    # style if Tuta rejects the first one as an invalid address.
+    display_name: Optional[str] = None
+    age: Optional[int] = None
 
     def record(self, message: str) -> None:
         self.log.append(message)
         print(f"[tuta-signup] {message}")
+
+    def next_username_candidate(self) -> str:
+        if self.display_name:
+            return generate_username_from_identity(self.display_name, self.age)
+        return generate_username()
 
 
 # --- Individual pipeline steps ------------------------------------------------
@@ -156,16 +209,40 @@ async def step_continue_after_plan(ctx: TutaSignupContext) -> None:
     ctx.record("Clicked Pokracovat after plan selection")
 
 
+INVALID_EMAIL_ERROR_TEXT = "E-mailová adresa není platná."
+MAX_USERNAME_ATTEMPTS = 5
+
+
+async def _username_rejected_as_invalid(page: Page) -> bool:
+    # Matched on the exact error text rather than the "mt-8" class alone -
+    # that class is just a generic Tailwind-style margin utility and could
+    # easily be reused elsewhere on the page for unrelated reasons.
+    return await page.get_by_text(INVALID_EMAIL_ERROR_TEXT, exact=True).count() > 0
+
+
 async def step_fill_credentials(ctx: TutaSignupContext) -> None:
     assert ctx.page is not None
     page = ctx.page
+    username_field = page.locator('[data-testid="tfi:username_label"]')
+
     # press_sequentially types one key at a time with a per-keystroke delay,
     # instead of .fill()'s instant paste-in - closer to how a person actually
     # types a username/password.
-    await page.locator('[data-testid="tfi:username_label"]').press_sequentially(
-        ctx.username, delay=_typing_delay()
-    )
-    await _human_delay(0.4, 1.2)
+    for attempt in range(1, MAX_USERNAME_ATTEMPTS + 1):
+        await username_field.press_sequentially(ctx.username, delay=_typing_delay())
+        # Tuta's inline validation renders near-instantly on blur/input, but
+        # give it a beat before checking - this also doubles as the usual
+        # human-like pause before moving to the next field.
+        await _human_delay(0.4, 1.0)
+        if not await _username_rejected_as_invalid(page):
+            break
+        ctx.record(f"Username '{ctx.username}' rejected as invalid (attempt {attempt}/{MAX_USERNAME_ATTEMPTS})")
+        if attempt == MAX_USERNAME_ATTEMPTS:
+            ctx.record(f"Still rejected after {MAX_USERNAME_ATTEMPTS} attempts, proceeding with '{ctx.username}' anyway")
+            break
+        await username_field.fill("")
+        ctx.username = ctx.next_username_candidate()
+
     await page.locator('[data-testid="tfi:newPassword_label"]').press_sequentially(
         ctx.password, delay=_typing_delay()
     )
@@ -258,6 +335,7 @@ async def run_tuta_signup_pipeline(
     wait_for_manual: Optional[Callable[[str], Awaitable[None]]] = None,
     proxy: Optional[ProxyConfig] = None,
     display_name: Optional[str] = None,
+    age: Optional[int] = None,
 ) -> TutaSignupContext:
     """Runs every step in PIPELINE_STEPS in order against a single browser
     context that stays open, unclosed and untouched by any other code, for
@@ -288,11 +366,13 @@ async def run_tuta_signup_pipeline(
     pool before calling this, so the signup runs from that IP rather than
     the backend machine's own.
 
-    display_name, if given and username isn't, is used to derive a
-    human-looking username (see generate_username_from_display_name)
-    instead of the generic bot-prefixed fallback."""
+    display_name / age, if display_name is given and username isn't, are
+    used to derive a human-looking username (see
+    generate_username_from_identity) instead of the generic bot-prefixed
+    fallback - age lets it pick a plausible birth-year-based suffix some of
+    the time instead of always the same random-digits shape."""
     if username is None:
-        username = generate_username_from_display_name(display_name) if display_name else generate_username()
+        username = generate_username_from_identity(display_name, age) if display_name else generate_username()
     password = password or generate_password()
 
     async with async_playwright() as pw:
@@ -304,6 +384,8 @@ async def run_tuta_signup_pipeline(
                 password=password,
                 context=browser_context,
                 wait_for_manual=wait_for_manual or _wait_via_stdin,
+                display_name=display_name,
+                age=age,
             )
             for index, step in enumerate(PIPELINE_STEPS):
                 if not step.manual and index > 0:
