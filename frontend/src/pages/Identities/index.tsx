@@ -1,12 +1,12 @@
 import { useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getProxies, updateProxy } from '../../api/proxies'
-import { getEmails, updateEmail } from '../../api/emails'
+import { getEmails, getEmailPlatforms, updateEmail } from '../../api/emails'
 import { createIdentity, deleteIdentity as deleteIdentityApi, getIdentities } from '../../api/identities'
 import { Modal }  from '../../components/ui/Modal'
 import { Button } from '../../components/ui/Button'
 import { format } from 'date-fns'
-import type { EmailAccount, Identity, IdentityStatus, Proxy } from '../../types'
+import type { EmailAccount, EmailPlatform, Identity, IdentityStatus, Proxy } from '../../types'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -53,8 +53,6 @@ interface RichIdentity {
   status: IdentityStatus
   created_at: string
 }
-
-const IDENTITY_PLATFORM_LABEL = 'Reddit'
 
 // ─── Country data ─────────────────────────────────────────────────────────────
 
@@ -255,7 +253,7 @@ function buildUA(os: string, browser: string, bv: number): string {
   return `Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:${bv}.0) Gecko/20100101 Firefox/${bv}.0`
 }
 
-function generateIdentityData(cc: string, email: EmailAccount, proxies: Proxy[]): RichIdentity {
+function generateIdentityData(cc: string, proxies: Proxy[]): RichIdentity {
   const country = COUNTRIES[cc] ?? COUNTRIES.US
   const names = NAMES[cc] ?? NAMES.US
   const gender = Math.random() > 0.5 ? 'male' : 'female'
@@ -302,7 +300,9 @@ function generateIdentityData(cc: string, email: EmailAccount, proxies: Proxy[])
     date_of_birth: dob, age,
     country: country.name, country_code: cc, city: pick(country.cities),
     languages: country.languages, timezone: country.timezone, timezone_offset: country.tz_offset,
-    email: email.address, email_id: email.id,
+    // No email yet - the Tuta signup pipeline attaches one in the background
+    // right after the identity is persisted (see handleGenerate below).
+    email: '', email_id: '',
     password: genPassword(),
     proxy_ids: proxies.map(p => p.id),
     proxy_details: proxies.map(p => ({
@@ -344,7 +344,7 @@ function hydrateIdentity(dbIdentity: Identity, proxies: Proxy[], emailAccounts: 
     languages: country.languages,
     timezone: country.timezone,
     timezone_offset: country.tz_offset,
-    email: dbIdentity.email,
+    email: dbIdentity.email ?? '',
     email_id: linkedEmail?.id ?? '',
     password: '••••••••',
     proxy_ids: attachedProxies.map((p) => p.id),
@@ -423,19 +423,19 @@ function Field({ label, mono, children }: { label: string; mono?: boolean; child
 
 function GenerateModal({
   proxies, proxiesLoading,
-  emailAccounts,
-  usedProxyIds, usedEmailIds,
+  usedProxyIds,
+  emailPlatforms,
   onGenerate, onClose,
 }: {
   proxies: Proxy[]
   proxiesLoading: boolean
-  emailAccounts: EmailAccount[]
   usedProxyIds: string[]
-  usedEmailIds: string[]
-  onGenerate: (country: string) => void | Promise<void>
+  emailPlatforms: EmailPlatform[]
+  onGenerate: (country: string, emailPlatformId: string) => void | Promise<void>
   onClose: () => void
 }) {
   const [country, setCountry]   = useState('')
+  const [emailPlatformId, setEmailPlatformId] = useState('')
 
   // Free proxies: healthy and not already assigned by backend or existing identity
   const freeProxies = proxies.filter(p =>
@@ -453,24 +453,14 @@ function GenerateModal({
     return { ok: true, msg: '' }
   })()
 
-  // Email check: not in use, not blocked on Reddit
-  const emailCheck = (() => {
-    const free = emailAccounts.filter(e =>
-      !e.used_by_bot_id && !usedEmailIds.includes(e.id) &&
-      !e.blocked_on_platforms.includes(IDENTITY_PLATFORM_LABEL)
-    )
-    if (free.length === 0) return { ok: false, msg: `No free email accounts available for ${IDENTITY_PLATFORM_LABEL}. Add email accounts in the Email Accounts page.` }
-    return { ok: true, count: free.length, msg: '' }
-  })()
-
-  const canGenerate = proxyCheck.ok && emailCheck.ok
+  const canGenerate = proxyCheck.ok && !!emailPlatformId
 
   return (
     <Modal title="Generate Identity" isOpen onClose={onClose}
       footer={
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button disabled={!canGenerate} onClick={() => onGenerate(country)}>
+          <Button disabled={!canGenerate} onClick={() => onGenerate(country, emailPlatformId)}>
             Generate
           </Button>
         </div>
@@ -493,6 +483,24 @@ function GenerateModal({
           </select>
         </div>
 
+        {/* Email provider */}
+        <div>
+          <label className="text-xs text-gray-500 block mb-1.5">
+            Email provider <span className="text-gray-700">— a mailbox is created here automatically</span>
+          </label>
+          <select value={emailPlatformId} onChange={e => setEmailPlatformId(e.target.value)}
+            className="w-full rounded-lg border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-1 focus:ring-brand-500"
+          >
+            <option value="">Select provider…</option>
+            {emailPlatforms.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          {emailPlatforms.length === 0 && (
+            <p className="text-xs text-red-400 mt-1.5">
+              No email providers configured yet. Add one on the Email Accounts page first.
+            </p>
+          )}
+        </div>
+
         {/* Resource status */}
         <div className="space-y-2">
           {/* Proxy status */}
@@ -509,17 +517,15 @@ function GenerateModal({
             </span>
           </div>
 
-          {/* Email status */}
-          <div className={`flex items-start gap-2.5 rounded-lg border px-3 py-2.5 text-xs ${
-            emailCheck.ok
-              ? 'border-emerald-700/40 bg-emerald-900/10 text-emerald-400'
-              : 'border-red-700/40 bg-red-900/10 text-red-400'
-          }`}>
-            <span className="shrink-0 mt-0.5">{emailCheck.ok ? '✓' : '✕'}</span>
+          {/* Email pipeline note */}
+          <div className="flex items-start gap-2.5 rounded-lg border border-sky-700/40 bg-sky-900/10 px-3 py-2.5 text-xs text-sky-400">
+            <span className="shrink-0 mt-0.5">i</span>
             <span>
-              {emailCheck.ok
-                ? `${emailCheck.count} free email${(emailCheck.count ?? 0) !== 1 ? 's' : ''} available for ${IDENTITY_PLATFORM_LABEL}`
-                : emailCheck.msg}
+              A mailbox with the selected provider is created automatically right after the
+              identity is generated, and attached once ready. Only providers with an automated
+              signup pipeline behind them (currently: Tuta) will actually complete — this runs
+              on the machine hosting the backend and needs one manual CAPTCHA step there. Track
+              progress on the Pipelines page.
             </span>
           </div>
         </div>
@@ -668,18 +674,25 @@ export default function IdentitiesPage() {
     queryKey: ['emails'],
     queryFn: () => getEmails(),
   })
+  const { data: emailPlatforms = [] } = useQuery({
+    queryKey: ['email-platforms'],
+    queryFn: () => getEmailPlatforms(),
+  })
   const { data: identitiesDb = [], refetch: refetchIdentities } = useQuery({
     queryKey: ['identities'],
     queryFn: () => getIdentities(),
+    // Keep polling briefly after generation so the attached email shows up
+    // once the background Tuta pipeline finishes (it can take a while - it
+    // waits on a manually-solved CAPTCHA).
+    refetchInterval: 10000,
   })
 
   const identities: RichIdentity[] = identitiesDb.map((i) => hydrateIdentity(i, proxies, emailAccounts))
 
   // IDs already committed to existing identities
   const usedProxyIds = identities.flatMap(i => i.proxy_ids ?? [])
-  const usedEmailIds = identities.map(i => i.email_id).filter(Boolean)
 
-  async function handleGenerate(requestedCountry: string) {
+  async function handleGenerate(requestedCountry: string, emailPlatformId: string) {
     const freeProxies = proxies.filter(p =>
       p.is_healthy && !p.assigned_bot_id && !usedProxyIds.includes(p.id)
     )
@@ -689,24 +702,15 @@ export default function IdentitiesPage() {
 
     const { cc, proxies: chosenProxies } = proxyResult
 
-    const freeEmails = emailAccounts.filter(e =>
-      !e.used_by_bot_id &&
-      !usedEmailIds.includes(e.id) &&
-      !e.blocked_on_platforms.includes(IDENTITY_PLATFORM_LABEL)
-    )
-    if (freeEmails.length === 0) return
+    const draftIdentity = generateIdentityData(cc, chosenProxies)
 
-    const chosenEmail = pick(freeEmails)
-
-    const draftIdentity = generateIdentityData(cc, chosenEmail, chosenProxies)
-
-    // Persist identity in backend DB first.
+    // Persist identity in backend DB first, with no email - omitting it (vs.
+    // an existing pooled address) is what tells the backend to kick off the
+    // signup pipeline for the chosen provider in the background and attach a
+    // mailbox once it's done.
     const created = await createIdentity({
       display_name: draftIdentity.display_name,
       username: draftIdentity.username,
-      email: draftIdentity.email,
-      email_provider: draftIdentity.email.split('@')[1] ?? 'unknown',
-      email_password: null,
       phone_number: null,
       phone_provider: null,
       profile_photo_url: null,
@@ -717,6 +721,7 @@ export default function IdentitiesPage() {
       browser_profile_id: `bp_${draftIdentity.id.slice(0, 8)}`,
       browser_profile_provider: 'custom',
       password: draftIdentity.password,
+      email_platform_id: emailPlatformId,
     })
     const identity: RichIdentity = {
       ...draftIdentity,
@@ -727,10 +732,6 @@ export default function IdentitiesPage() {
     // Mark proxies as in use by this identity
     await Promise.all(chosenProxies.map((p) => updateProxy(p.id, { assigned_bot_id: identity.id })))
     await refetchProxies()
-
-    // Mark email as in use
-    await updateEmail(chosenEmail.id, { used_by_bot_id: identity.id })
-    await refetchEmails()
 
     setShowGenerate(false)
     await refetchIdentities()
@@ -868,9 +869,8 @@ export default function IdentitiesPage() {
         <GenerateModal
           proxies={proxies}
           proxiesLoading={proxiesLoading}
-          emailAccounts={emailAccounts}
           usedProxyIds={usedProxyIds}
-          usedEmailIds={usedEmailIds}
+          emailPlatforms={emailPlatforms}
           onGenerate={handleGenerate}
           onClose={() => setShowGenerate(false)}
         />

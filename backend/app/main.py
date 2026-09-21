@@ -27,6 +27,39 @@ async def _ensure_sqlite_compat_columns() -> None:
         if "password" not in columns:
             await conn.exec_driver_sql("ALTER TABLE bots ADD COLUMN password VARCHAR(256)")
 
+        # identities.email / email_provider used to be NOT NULL; identities can
+        # now exist before their mailbox does, so relax that constraint on
+        # existing local databases (SQLite has no ALTER COLUMN, so rebuild the
+        # table - safe regardless of row count since column set/order/defaults
+        # are all preserved from PRAGMA table_info).
+        id_rows = await conn.exec_driver_sql("PRAGMA table_info(identities)")
+        id_cols = id_rows.fetchall()  # (cid, name, type, notnull, dflt_value, pk)
+        by_name = {row[1]: row for row in id_cols}
+        needs_rebuild = by_name and (by_name["email"][3] == 1 or by_name["email_provider"][3] == 1)
+        if needs_rebuild:
+            names = [row[1] for row in id_cols]
+            col_defs = []
+            for _cid, name, ctype, notnull, dflt, pk in id_cols:
+                force_nullable = name in ("email", "email_provider")
+                parts = [name, ctype or "TEXT"]
+                if pk:
+                    parts.append("PRIMARY KEY")
+                if notnull and not force_nullable:
+                    parts.append("NOT NULL")
+                if dflt is not None:
+                    parts.append(f"DEFAULT {dflt}")
+                col_defs.append(" ".join(parts))
+            await conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            await conn.exec_driver_sql(
+                f"CREATE TABLE identities_new ({', '.join(col_defs)}, UNIQUE(username), UNIQUE(email))"
+            )
+            await conn.exec_driver_sql(
+                f"INSERT INTO identities_new ({', '.join(names)}) SELECT {', '.join(names)} FROM identities"
+            )
+            await conn.exec_driver_sql("DROP TABLE identities")
+            await conn.exec_driver_sql("ALTER TABLE identities_new RENAME TO identities")
+            await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

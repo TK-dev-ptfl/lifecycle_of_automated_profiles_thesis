@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getBots, updateBot } from '../../api/bots'
 import { createEmail, getEmailPlatforms } from '../../api/emails'
+import { continuePipeline, getAllPipelineStatus, getIdentities, type PipelineStatus } from '../../api/identities'
 import { Button } from '../../components/ui/Button'
 import type { Bot } from '../../types'
 
@@ -1462,6 +1463,215 @@ function PipelineView({
   )
 }
 
+// ─── Email Account Creation — live view (real backend pipeline) ───────────────
+//
+// Unlike every other section on this page, this one isn't a localStorage
+// simulation - it polls the real backend (GET /api/identities/pipeline-status),
+// which reflects app.pipelines.email_pool.progress, updated live as
+// identity_service.start_email_pipeline_for_identity actually runs Playwright
+// through app/pipelines/email_pool/providers/<provider>.py's steps.
+
+function statusBadgeClasses(status: PipelineStatus['status']): string {
+  switch (status) {
+    case 'completed': return 'bg-emerald-900/40 text-emerald-400 border-emerald-700/40'
+    case 'waiting_manual': return 'bg-amber-900/40 text-amber-400 border-amber-700/40'
+    case 'failed': return 'bg-red-900/40 text-red-400 border-red-700/40'
+    default: return 'bg-blue-900/40 text-blue-400 border-blue-700/40'
+  }
+}
+
+function statusLabel(status: PipelineStatus['status']): string {
+  switch (status) {
+    case 'completed': return 'done'
+    case 'waiting_manual': return 'waiting on captcha'
+    case 'failed': return 'failed'
+    default: return 'running'
+  }
+}
+
+function StatusBadge({ status }: { status: PipelineStatus['status'] }) {
+  return (
+    <span className={`px-2 py-0.5 rounded-full border text-[10px] uppercase tracking-wide whitespace-nowrap ${statusBadgeClasses(status)}`}>
+      {statusLabel(status)}
+    </span>
+  )
+}
+
+function EmailCreationLiveView({ providerFilter }: { providerFilter: string }) {
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [continuing, setContinuing] = useState<string | null>(null)
+
+  const { data: identities = [] } = useQuery({
+    queryKey: ['identities'],
+    queryFn: () => getIdentities(),
+    refetchInterval: 4000,
+  })
+  const { data: statuses = [], refetch: refetchStatuses } = useQuery({
+    queryKey: ['identities-pipeline-status'],
+    queryFn: () => getAllPipelineStatus(),
+    refetchInterval: 4000,
+  })
+
+  async function handleContinue(identityId: string) {
+    setContinuing(identityId)
+    try {
+      await continuePipeline(identityId)
+      await refetchStatuses()
+    } finally {
+      setContinuing(null)
+    }
+  }
+
+  const statusByIdentity = new Map(statuses.map(s => [s.identity_id, s]))
+
+  const relevant = identities
+    .filter(i => statusByIdentity.has(i.id))
+    .filter(i => !providerFilter || statusByIdentity.get(i.id)!.provider.toLowerCase() === providerFilter.toLowerCase())
+
+  const expanded = relevant.find(i => i.id === expandedId)
+  const expandedStatus = expanded ? statusByIdentity.get(expanded.id) : undefined
+
+  return (
+    <div className="grid grid-cols-3 gap-4">
+      {/* Identity list */}
+      <div className="col-span-1 space-y-2">
+        <p className="text-xs text-gray-500 uppercase tracking-wider px-1 mb-3">Identities creating a mailbox</p>
+        {relevant.length === 0 ? (
+          <p className="text-xs text-gray-700 text-center py-4 rounded-lg border border-gray-700/30 bg-gray-800/20">
+            None in progress. Generate an identity on the Identities page to start one.
+          </p>
+        ) : (
+          relevant.map(i => {
+            const s = statusByIdentity.get(i.id)!
+            const total = s.steps.length || 1
+            const pct = s.status === 'completed' ? 100 : Math.round(((s.step_index + 1) / total) * 100)
+            return (
+              <button
+                key={i.id}
+                onClick={() => setExpandedId(expandedId === i.id ? null : i.id)}
+                className={`w-full text-left rounded-lg border p-3 transition-all ${
+                  expandedId === i.id
+                    ? 'border-blue-700/50 bg-blue-900/20'
+                    : 'border-gray-700/40 bg-gray-800/20 hover:border-gray-600/50'
+                }`}
+              >
+                <div className="flex items-center justify-between mb-1 gap-2">
+                  <span className="text-sm font-medium text-gray-200 truncate">{i.display_name}</span>
+                  <StatusBadge status={s.status} />
+                </div>
+                <div className="w-full h-1 rounded-full bg-gray-700 mb-1.5">
+                  <div
+                    className={`h-full rounded-full transition-all ${s.status === 'failed' ? 'bg-red-500' : 'bg-brand-500'}`}
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+                <div className="text-xs text-gray-600 truncate">
+                  {s.status === 'completed' ? 'Complete' : s.status === 'failed' ? (s.error ?? 'Failed') : (s.step_name?.replace(/_/g, ' ') ?? 'Starting…')}
+                </div>
+              </button>
+            )
+          })
+        )}
+      </div>
+
+      {/* Detail */}
+      <div className="col-span-2">
+        {expanded && expandedStatus ? (
+          <div className="rounded-xl border border-gray-700/50 bg-gray-800/30 p-5 space-y-4">
+            <div className="flex items-start justify-between">
+              <div>
+                <h3 className="text-lg font-semibold text-gray-100">{expanded.display_name}</h3>
+                <p className="text-xs text-gray-600 mt-1 flex items-center gap-2">
+                  Provider: {expandedStatus.provider} <StatusBadge status={expandedStatus.status} />
+                </p>
+              </div>
+            </div>
+
+            {expandedStatus.status === 'failed' && (
+              <div className="rounded-lg border border-red-700/40 bg-red-900/20 p-3">
+                <p className="text-sm text-red-300">{expandedStatus.error}</p>
+              </div>
+            )}
+
+            <div className="space-y-2 max-h-96 overflow-y-auto">
+              {expandedStatus.steps.map((step, idx) => {
+                const isCompleted = idx < expandedStatus.step_index
+                  || (idx === expandedStatus.step_index && expandedStatus.status === 'completed')
+                const isCurrent = idx === expandedStatus.step_index && expandedStatus.status !== 'completed'
+
+                return (
+                  <div
+                    key={step.name}
+                    className={`rounded-lg border p-3 transition-colors ${
+                      isCompleted
+                        ? 'border-emerald-700/40 bg-emerald-900/10'
+                        : isCurrent
+                          ? 'border-amber-700/60 bg-amber-900/10'
+                          : 'border-gray-700/30 bg-gray-800/20'
+                    }`}
+                  >
+                    <div className="flex items-start gap-2">
+                      <div className={`shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold border ${
+                        isCompleted
+                          ? 'bg-emerald-500/20 text-emerald-400 border-emerald-700/40'
+                          : isCurrent
+                            ? 'bg-amber-500/20 text-amber-400 border-amber-700/40'
+                            : 'bg-gray-700/50 text-gray-600 border-gray-600/40'
+                      }`}>
+                        {isCompleted ? '✓' : idx + 1}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className={`text-sm font-medium ${
+                            isCompleted ? 'text-emerald-300' : isCurrent ? 'text-amber-300' : 'text-gray-300'
+                          }`}>
+                            {step.name.replace(/_/g, ' ')}
+                          </span>
+                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase tracking-wide ${
+                            step.manual
+                              ? 'bg-amber-900/40 text-amber-400 border border-amber-700/40'
+                              : 'bg-blue-900/40 text-blue-400 border border-blue-700/40'
+                          }`}>
+                            {step.manual ? 'manual' : 'auto'}
+                          </span>
+                        </div>
+                        {isCurrent && step.manual && (
+                          <div className="mt-2 space-y-2">
+                            <p className="text-xs text-amber-400">
+                              Waiting for the CAPTCHA to be solved in the browser window on the machine running the backend.
+                            </p>
+                            <Button
+                              onClick={() => handleContinue(expanded!.id)}
+                              disabled={continuing === expanded!.id}
+                              className="text-xs"
+                            >
+                              {continuing === expanded!.id ? 'Continuing…' : '✓ I solved the CAPTCHA — Continue'}
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+
+            {expandedStatus.status === 'completed' && (
+              <div className="rounded-lg border border-emerald-700/40 bg-emerald-900/10 p-3">
+                <p className="text-sm text-emerald-300 font-semibold">✓ Mailbox created: {expanded.email}</p>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="rounded-xl border border-gray-700/50 bg-gray-800/30 p-5 text-center">
+            <p className="text-gray-500 text-sm">Select an identity to see its pipeline progress</p>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function PipelinesPage() {
@@ -1716,7 +1926,7 @@ export default function PipelinesPage() {
               onChange={e => setSelectedEmailProviderId(e.target.value)}
               className="w-full max-w-sm rounded-lg border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-1 focus:ring-brand-500"
             >
-              <option value="">Select provider�</option>
+              <option value="">Select provider�</option>
               {emailProviders.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
             </select>
           </div>
@@ -1743,25 +1953,31 @@ export default function PipelinesPage() {
 
             <div className="flex-1" />
 
-            {/* View mode tabs */}
-            <div className="flex gap-2">
-              {(['steps', 'runs'] as const).map(v => (
-                <button
-                  key={v}
-                  onClick={() => setEmailView(v)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                    emailView === v
-                      ? 'border-gray-600 bg-gray-700/50 text-gray-100'
-                      : 'border-gray-700/50 bg-gray-800/40 text-gray-500 hover:text-gray-300'
-                  }`}
-                >
-                  {v === 'steps' ? '📋 By Steps' : emailPipelineType === 'creation' ? '📦 By Tasks' : '📧 By Mails'}
-                </button>
-              ))}
-            </div>
+            {/* View mode tabs - only meaningful for the simulated verification pipeline */}
+            {emailPipelineType === 'trust' && (
+              <div className="flex gap-2">
+                {(['steps', 'runs'] as const).map(v => (
+                  <button
+                    key={v}
+                    onClick={() => setEmailView(v)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                      emailView === v
+                        ? 'border-gray-600 bg-gray-700/50 text-gray-100'
+                        : 'border-gray-700/50 bg-gray-800/40 text-gray-500 hover:text-gray-300'
+                    }`}
+                  >
+                    {v === 'steps' ? '📋 By Steps' : '📧 By Mails'}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
-          {emailPipeline ? (
+          {emailPipelineType === 'creation' ? (
+            <EmailCreationLiveView
+              providerFilter={emailProviders.find(p => p.id === selectedEmailProviderId)?.name ?? ''}
+            />
+          ) : emailPipeline ? (
             emailView === 'steps' ? (
               <EmailPipelineView
                 pipeline={emailPipeline}
@@ -1784,7 +2000,7 @@ export default function PipelinesPage() {
             )
           ) : (
             <div className="rounded-xl border border-dashed border-gray-700/50 py-16 text-center">
-              <p className="text-sm text-gray-500">No {emailPipelineType === 'creation' ? 'creation' : 'verification'} pipeline defined for this provider.</p>
+              <p className="text-sm text-gray-500">No verification pipeline defined for this provider.</p>
             </div>
           )}
         </>

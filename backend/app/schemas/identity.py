@@ -9,8 +9,8 @@ from app.models.identity import IdentityStatus
 class IdentityBase(BaseModel):
     display_name: str
     username: str
-    email: str
-    email_provider: str
+    email: Optional[str] = None
+    email_provider: Optional[str] = None
     email_password: Optional[str] = None
     phone_number: Optional[str] = None
     phone_provider: Optional[str] = None
@@ -25,6 +25,13 @@ class IdentityBase(BaseModel):
 
 class IdentityCreate(IdentityBase):
     password: str
+    # Which EmailPlatform to create a mailbox with, when email is omitted.
+    # Not a column on Identity itself - only used to pick the pipeline to run.
+    email_platform_id: Optional[UUID] = None
+
+
+class GenerateIdentityRequest(BaseModel):
+    email_platform_id: Optional[UUID] = None
 
 
 class IdentityUpdate(BaseModel):
@@ -34,6 +41,9 @@ class IdentityUpdate(BaseModel):
     status: Optional[IdentityStatus] = None
     phone_number: Optional[str] = None
     interests: Optional[list] = None
+    email: Optional[str] = None
+    email_provider: Optional[str] = None
+    email_password: Optional[str] = None
 
 
 class IdentityResponse(IdentityBase):

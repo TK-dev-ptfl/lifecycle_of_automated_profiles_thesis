@@ -22,8 +22,11 @@ class Identity(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
     username: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
-    email: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
-    email_provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Nullable: an identity can exist before its mailbox does — the email
+    # pipeline (see services.identity_service.start_email_pipeline_for_identity)
+    # fills these in once it finishes creating the account.
+    email: Mapped[Optional[str]] = mapped_column(String(256), unique=True, nullable=True)
+    email_provider: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     email_password: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     phone_number: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     phone_provider: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)

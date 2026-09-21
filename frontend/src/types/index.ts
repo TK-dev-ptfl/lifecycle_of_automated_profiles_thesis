@@ -26,8 +26,13 @@ export interface Identity {
   id: string
   display_name: string
   username: string
-  email: string
-  email_provider: string
+  // Null until the email pipeline finishes and attaches a mailbox - an
+  // identity is created before it has an email, not after.
+  email: string | null
+  email_provider: string | null
+  // Write-only: which EmailPlatform to run the signup pipeline against when
+  // email is omitted. Not returned by the API, only accepted on create.
+  email_platform_id?: string
   phone_number?: string
   phone_provider?: string
   profile_photo_url?: string

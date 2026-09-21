@@ -6,8 +6,38 @@ export const getIdentities = async (params?: Record<string, string>) => {
   return data
 }
 
-export const generateIdentity = async () => {
-  const { data } = await api.post<Identity>('/api/identities/generate')
+export const generateIdentity = async (emailPlatformId: string) => {
+  const { data } = await api.post<Identity>('/api/identities/generate', { email_platform_id: emailPlatformId })
+  return data
+}
+
+export interface PipelineStatus {
+  identity_id: string
+  provider: string
+  status: 'running' | 'waiting_manual' | 'completed' | 'failed'
+  step_index: number
+  step_name: string | null
+  manual: boolean
+  steps: { name: string; manual: boolean }[]
+  error: string | null
+  started_at: string
+  updated_at: string
+}
+
+export const getAllPipelineStatus = async () => {
+  const { data } = await api.get<PipelineStatus[]>('/api/identities/pipeline-status')
+  return data
+}
+
+export const getPipelineStatus = async (identityId: string) => {
+  const { data } = await api.get<PipelineStatus>(`/api/identities/${identityId}/pipeline-status`)
+  return data
+}
+
+// Click target for "I solved the CAPTCHA - Continue": resumes a pipeline
+// paused on its manual step instead of it waiting on backend terminal stdin.
+export const continuePipeline = async (identityId: string) => {
+  const { data } = await api.post<{ ok: boolean }>(`/api/identities/${identityId}/pipeline-status/continue`)
   return data
 }
 
