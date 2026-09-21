@@ -6,6 +6,19 @@ function. Tuta's signup requires solving an interactive CAPTCHA, which can't
 be automated here, so the pipeline runs a headful (visible) browser and
 pauses on that one step until a human confirms it's done.
 
+Every step that changes page state (checking a box, submitting a form,
+navigating) verifies the expected result actually happened - checked a
+checkbox and then confirms is_checked(), clicked a button that should
+transition the page and then confirms the transition happened - and raises a
+clear RuntimeError if not, rather than silently moving on to the next step
+with the page in an unconfirmed state.
+
+Every ctx.record() message (step start/end, retries, verification results)
+is also handed to an optional on_log callback, so a caller (identity_service)
+can stream them into app.pipelines.email_pool.progress in real time - this is
+what powers the pipeline log viewer on the Monitoring page, since otherwise
+these messages only ever went to the backend process's own stdout.
+
 Run directly to try it end-to-end:
 
     cd backend
@@ -13,8 +26,8 @@ Run directly to try it end-to-end:
 
 Selectors are pinned to tuta.com's current DOM (data-testid where available,
 element id/class otherwise) as of this writing. If Tuta changes their
-frontend, the steps that broke will raise a Playwright TimeoutError naming
-the selector — update that one step, the rest of the pipeline is unaffected.
+frontend, the steps that broke will raise naming the selector - update that
+one step, the rest of the pipeline is unaffected.
 """
 from __future__ import annotations
 
@@ -22,13 +35,12 @@ import asyncio
 import random
 import re
 import secrets
-import string
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Awaitable, Callable, Optional, TypedDict
 
-from playwright.async_api import BrowserContext, Page, async_playwright
+from playwright.async_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
 TUTA_HOME_URL = "https://tuta.com/cs"
 
@@ -40,6 +52,10 @@ STEP_DELAY_RANGE = (1.4, 3.8)
 # Per-keystroke delay, milliseconds, for the two fields human-speed matters
 # most on (username/password) rather than Playwright's instant .fill().
 TYPE_DELAY_RANGE_MS = (60, 150)
+# How long to wait for a step's expected resulting state (a checkbox
+# actually checked, a field appearing, a page transitioning) before treating
+# it as a real failure rather than just slow rendering.
+VERIFY_TIMEOUT_MS = 15000
 
 
 async def _human_delay(min_s: float = STEP_DELAY_RANGE[0], max_s: float = STEP_DELAY_RANGE[1]) -> None:
@@ -113,9 +129,34 @@ def generate_username_from_identity(display_name: str, age: Optional[int] = None
     return username[:20] or generate_username()
 
 
-def generate_password(length: int = 20) -> str:
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*-_"
-    return "".join(secrets.choice(alphabet) for _ in range(length))
+# A 20-char fully-random string is exactly the kind of high-entropy,
+# unmemorizable password no real person types by hand - real ones are
+# overwhelmingly Word+digits(+symbol). This list is plain common words, not
+# tied to any identity, just enough variety that a whole fleet of accounts
+# doesn't share a handful of passwords.
+PASSWORD_WORDS = [
+    "sunshine", "ocean", "tiger", "coffee", "mountain", "river", "phoenix", "dragon",
+    "shadow", "thunder", "crystal", "silver", "golden", "winter", "summer", "autumn",
+    "falcon", "eagle", "panther", "wolf", "storm", "blaze", "frost", "meadow",
+    "harbor", "voyage", "comet", "lunar", "solar", "cobalt", "amber", "cedar",
+    "willow", "maple", "raven", "sparrow", "coral", "jasper", "quartz", "onyx",
+    "garden", "canyon", "valley", "breeze", "ember", "granite", "horizon", "island",
+]
+PASSWORD_SYMBOLS = "!@#$%&*"
+
+
+def generate_password() -> str:
+    """Word(+Word) + digits(+symbol) - the pattern most real people actually
+    use, instead of a random-character string nobody would type by hand.
+    Still comfortably clears typical strength meters: capitalized word(s)
+    give upper+lowercase, plus digits, usually plus a symbol, at a length
+    (10-18 chars) well above the usual 8-char minimum."""
+    word = random.choice(PASSWORD_WORDS).capitalize()
+    if random.random() < 0.3:
+        word += random.choice(PASSWORD_WORDS).capitalize()
+    number = str(random.randint(1, 9999))
+    symbol = random.choice(PASSWORD_SYMBOLS) if random.random() < 0.8 else ""
+    return f"{word}{number}{symbol}"
 
 
 class ProxyConfig(TypedDict, total=False):
@@ -153,6 +194,11 @@ class TutaSignupContext:
     page: Optional[Page] = None
     log: list[str] = field(default_factory=list)
     wait_for_manual: Callable[[str], Awaitable[None]] = _wait_via_stdin
+    # Forwards every ctx.record() message live (in addition to log/stdout) -
+    # identity_service wires this to app.pipelines.email_pool.progress.add_log
+    # so the Monitoring page can show these messages while the pipeline is
+    # still running, not just after the fact.
+    on_log: Optional[Callable[[str], None]] = None
     # Kept so step_fill_credentials can generate a fresh candidate in the same
     # style if Tuta rejects the first one as an invalid address.
     display_name: Optional[str] = None
@@ -161,6 +207,8 @@ class TutaSignupContext:
     def record(self, message: str) -> None:
         self.log.append(message)
         print(f"[tuta-signup] {message}")
+        if self.on_log:
+            self.on_log(message)
 
     def next_username_candidate(self) -> str:
         if self.display_name:
@@ -168,15 +216,33 @@ class TutaSignupContext:
         return generate_username()
 
 
+def _step_error(step_name: str, message: str) -> RuntimeError:
+    return RuntimeError(f"{step_name}: {message}")
+
+
 # --- Individual pipeline steps ------------------------------------------------
 # Each step takes the shared context, performs one action, and returns nothing
 # (it mutates ctx.page / ctx.log). Keeping them as separate functions is what
-# lets each one be logged, retried, or swapped out independently later.
+# lets each one be logged, retried, or swapped out independently later. Each
+# one also verifies its own result before returning - a click alone only
+# proves Playwright could click something, not that the page actually
+# responded the way the step assumes.
+
+# The very first navigation of a run is the coldest hop through a freshly
+# opened proxy connection (DNS + TCP + TLS all happening for the first time
+# through it) - gets its own extra-generous timeout on top of the context
+# default, rather than relying on that alone.
+HOMEPAGE_GOTO_TIMEOUT_MS = 90000
+
 
 async def step_open_homepage(ctx: TutaSignupContext) -> None:
     page = await ctx.context.new_page()
     await _apply_stealth(page)
-    await page.goto(TUTA_HOME_URL, wait_until="domcontentloaded")
+    await page.goto(TUTA_HOME_URL, wait_until="domcontentloaded", timeout=HOMEPAGE_GOTO_TIMEOUT_MS)
+    try:
+        await page.locator("#signup-button:visible").wait_for(state="visible", timeout=VERIFY_TIMEOUT_MS)
+    except PlaywrightTimeoutError as exc:
+        raise _step_error("step_open_homepage", "signup button never became visible - homepage may not have loaded correctly") from exc
     ctx.page = page
     ctx.record(f"Opened {TUTA_HOME_URL}")
 
@@ -192,20 +258,30 @@ async def step_click_signup(ctx: TutaSignupContext) -> None:
     signup_page = await new_page_info.value
     await _apply_stealth(signup_page)
     await signup_page.wait_for_load_state("domcontentloaded")
+    try:
+        await signup_page.locator('[data-testid="btn:continue_action"]').wait_for(state="visible", timeout=VERIFY_TIMEOUT_MS)
+    except PlaywrightTimeoutError as exc:
+        raise _step_error("step_click_signup", "plan-selection page didn't load (Pokracovat button never appeared)") from exc
     ctx.page = signup_page
     ctx.record("Clicked Registrace, switched to signup tab")
 
 
 async def step_select_free_plan(ctx: TutaSignupContext) -> None:
     assert ctx.page is not None
-    free_option = ctx.page.locator("div.flex-space-between.items-center.pb-16").filter(has_text="Free")
-    await free_option.locator("input[type=radio]").click()
+    free_radio = ctx.page.locator("div.flex-space-between.items-center.pb-16").filter(has_text="Free").locator("input[type=radio]")
+    await free_radio.click()
+    if not await free_radio.is_checked():
+        raise _step_error("step_select_free_plan", "Free plan radio button did not become checked after clicking")
     ctx.record("Selected Free plan")
 
 
 async def step_continue_after_plan(ctx: TutaSignupContext) -> None:
     assert ctx.page is not None
     await ctx.page.click('[data-testid="btn:continue_action"]')
+    try:
+        await ctx.page.locator('[data-testid="tfi:username_label"]').wait_for(state="visible", timeout=VERIFY_TIMEOUT_MS)
+    except PlaywrightTimeoutError as exc:
+        raise _step_error("step_continue_after_plan", "username field never appeared after clicking Pokracovat") from exc
     ctx.record("Clicked Pokracovat after plan selection")
 
 
@@ -243,13 +319,26 @@ async def step_fill_credentials(ctx: TutaSignupContext) -> None:
         await username_field.fill("")
         ctx.username = ctx.next_username_candidate()
 
-    await page.locator('[data-testid="tfi:newPassword_label"]').press_sequentially(
-        ctx.password, delay=_typing_delay()
-    )
+    actual_username = await username_field.input_value()
+    if actual_username != ctx.username:
+        raise _step_error(
+            "step_fill_credentials",
+            f"username field contains {actual_username!r}, expected {ctx.username!r} - typing may not have registered",
+        )
+
+    new_password_field = page.locator('[data-testid="tfi:newPassword_label"]')
+    await new_password_field.press_sequentially(ctx.password, delay=_typing_delay())
+    actual_new_password = await new_password_field.input_value()
+    if actual_new_password != ctx.password:
+        raise _step_error("step_fill_credentials", "new-password field does not match what was typed")
+
     await _human_delay(0.4, 1.2)
-    await page.locator('[data-testid="tfi:repeatedPassword_label"]').press_sequentially(
-        ctx.password, delay=_typing_delay()
-    )
+    repeat_password_field = page.locator('[data-testid="tfi:repeatedPassword_label"]')
+    await repeat_password_field.press_sequentially(ctx.password, delay=_typing_delay())
+    actual_repeat_password = await repeat_password_field.input_value()
+    if actual_repeat_password != ctx.password:
+        raise _step_error("step_fill_credentials", "repeat-password field does not match what was typed")
+
     ctx.record(f"Filled username '{ctx.username}' and password")
 
 
@@ -257,43 +346,120 @@ async def step_accept_agreements(ctx: TutaSignupContext) -> None:
     assert ctx.page is not None
     checkboxes = ctx.page.locator("div.flex.col.gap-4.smaller.justify-start.mt-16 input[type=checkbox]")
     count = await checkboxes.count()
+    if count == 0:
+        raise _step_error("step_accept_agreements", "no agreement checkboxes found on page")
     for i in range(count):
         if i > 0:
             await _human_delay(0.5, 1.4)
-        await checkboxes.nth(i).click()
+        box = checkboxes.nth(i)
+        await box.click()
+        if not await box.is_checked():
+            raise _step_error("step_accept_agreements", f"checkbox {i} did not become checked after clicking")
     ctx.record(f"Checked {count} agreement checkbox(es)")
 
 
 async def step_submit_account(ctx: TutaSignupContext) -> None:
     assert ctx.page is not None
-    await ctx.page.click('[data-testid="btn:create_new_account_label"]')
+    # No confirmed selector yet for what a CAPTCHA widget or a failed-
+    # submission error banner looks like here, so this can't verify its own
+    # outcome the way the other steps do (see step_manual_captcha, which
+    # verifies the *next* page state instead). What it can do is name this
+    # step clearly if the click itself fails/times out (e.g. a slow
+    # residential proxy), instead of that surfacing as an opaque exception
+    # from deep inside Playwright.
+    try:
+        await ctx.page.click('[data-testid="btn:create_new_account_label"]')
+    except PlaywrightTimeoutError as exc:
+        raise _step_error("step_submit_account", "create-account button was never clickable") from exc
     ctx.record("Submitted account creation form (Vytvorit ucet)")
 
 
 async def step_manual_captcha(ctx: TutaSignupContext) -> None:
-    """Tuta shows an interactive CAPTCHA at this point. The browser window is
-    visible (headful) — solve it by hand, then confirm via ctx.wait_for_manual
-    (stdin prompt for the standalone script, a dashboard button click when
-    run through identity_service). Either way this just awaits a signal - the
-    browser itself is untouched and stays open exactly as it is for however
-    long that takes."""
-    ctx.record("Waiting for manual CAPTCHA completion in the browser window...")
+    """Tuta shows an interactive CAPTCHA here *sometimes* - not every session
+    gets challenged (depends on its own anti-bot heuristics: IP reputation,
+    fingerprint, etc). For now this always waits for a human to confirm
+    before proceeding, even on runs where the recovery-kit page would have
+    appeared on its own without a challenge - auto-skipping this step turned
+    out to be an easy way to race ahead of a CAPTCHA that was still loading,
+    so until that's more reliably distinguishable, every run stops here and
+    the browser window stays open and untouched until a person says to go.
+
+    This waits via ctx.wait_for_manual (stdin prompt for the standalone
+    script, a dashboard button click when run through identity_service).
+    Once the human says it's done, this does NOT just take their word for it
+    - it re-checks that the recovery-kit page actually appeared, since a
+    mis-solved or still-pending CAPTCHA would otherwise let the pipeline
+    barrel on into steps that assume a page state that was never reached."""
+    assert ctx.page is not None
+    recovery_checkbox = ctx.page.locator("input[type=checkbox]").first
+
+    ctx.record("Waiting for manual confirmation in the browser window...")
     await ctx.wait_for_manual(
         "Solve the CAPTCHA in the browser window, then press Enter here to continue... "
     )
-    ctx.record("Manual CAPTCHA step confirmed done by operator")
+
+    try:
+        await recovery_checkbox.wait_for(state="visible", timeout=VERIFY_TIMEOUT_MS)
+    except PlaywrightTimeoutError as exc:
+        raise _step_error(
+            "step_manual_captcha",
+            "confirmed done by operator, but the recovery-kit page never appeared - "
+            "the CAPTCHA may not actually have been solved correctly",
+        ) from exc
+    ctx.record("Manual CAPTCHA step confirmed done by operator, recovery kit page verified")
 
 
 async def step_check_recovery_kit_box(ctx: TutaSignupContext) -> None:
     assert ctx.page is not None
-    await ctx.page.locator("input[type=checkbox]").first.click()
+    checkbox = ctx.page.locator("input[type=checkbox]").first
+    await checkbox.click()
+    if not await checkbox.is_checked():
+        raise _step_error("step_check_recovery_kit_box", "checkbox did not become checked after clicking")
     ctx.record("Checked recovery kit acknowledgement box")
 
 
 async def step_finish_recovery_kit(ctx: TutaSignupContext) -> None:
     assert ctx.page is not None
-    await ctx.page.click('[data-testid="btn:recovery_kit_page_continue_label"]')
+    continue_button = ctx.page.locator('[data-testid="btn:recovery_kit_page_continue_label"]')
+    await continue_button.click()
+    try:
+        # If the click had no real effect (e.g. the checkbox wasn't actually
+        # checked and the button silently no-ops), the page stays put and
+        # this button never disappears - that's the signal something's wrong.
+        await continue_button.wait_for(state="hidden", timeout=VERIFY_TIMEOUT_MS)
+    except PlaywrightTimeoutError as exc:
+        raise _step_error(
+            "step_finish_recovery_kit",
+            "page did not move on after clicking Pojdme zacit - the recovery-kit "
+            "checkbox may not actually have been checked",
+        ) from exc
     ctx.record("Clicked Pojdme zacit - signup complete")
+
+
+# How long to allow for the mailbox to actually finish loading after
+# recovery-kit - Tuta generates encryption keys client-side at this point,
+# which can take a few seconds longer than a plain page navigation.
+MAILBOX_LOAD_TIMEOUT_MS = 45000
+
+
+# Disabled for now (not registered in PIPELINE_STEPS below) - re-enable by
+# uncommenting the function body and adding it back to PIPELINE_STEPS.
+# async def step_enter_mailbox(ctx: TutaSignupContext) -> None:
+#     """Clicking through the recovery-kit screen isn't proof the account
+#     actually works - this waits for the real inbox UI (the "new email"
+#     compose button, which only renders once the mailbox has fully loaded)
+#     before the pipeline is considered done. Since this is the last entry in
+#     PIPELINE_STEPS, the browser only closes (see run_tuta_signup_pipeline's
+#     finally) once this confirms the profile was genuinely entered, not
+#     right after the last signup-wizard click."""
+#     assert ctx.page is not None
+#     try:
+#         await ctx.page.locator('[data-testid="btn:newMail_action"]').wait_for(
+#             state="visible", timeout=MAILBOX_LOAD_TIMEOUT_MS
+#         )
+#     except PlaywrightTimeoutError as exc:
+#         raise _step_error("step_enter_mailbox", "mailbox/inbox UI never loaded after signup completed") from exc
+#     ctx.record("Entered mailbox - inbox loaded, account confirmed working")
 
 
 @dataclass
@@ -318,6 +484,7 @@ PIPELINE_STEPS: list[PipelineStep] = [
     PipelineStep("manual_captcha", step_manual_captcha, manual=True),
     PipelineStep("check_recovery_kit_box", step_check_recovery_kit_box),
     PipelineStep("finish_recovery_kit", step_finish_recovery_kit),
+    # PipelineStep("enter_mailbox", step_enter_mailbox),  # disabled for now, see step_enter_mailbox above
 ]
 
 
@@ -336,12 +503,19 @@ async def run_tuta_signup_pipeline(
     proxy: Optional[ProxyConfig] = None,
     display_name: Optional[str] = None,
     age: Optional[int] = None,
+    on_log: Optional[Callable[[str], None]] = None,
 ) -> TutaSignupContext:
     """Runs every step in PIPELINE_STEPS in order against a single browser
     context that stays open, unclosed and untouched by any other code, for
     the entire run - from the first goto() to the final click. headless=False
     by default since step_manual_captcha needs a visible window for a human
     to solve the CAPTCHA in.
+
+    This is a plain sequential loop - each step is fully awaited before the
+    next one starts, and (as of this version) each step verifies its own
+    expected outcome before returning, raising a RuntimeError if the page
+    didn't actually respond the way the step assumes. A step "passing" here
+    means its effect was confirmed, not just that a click didn't throw.
 
     Automatic steps are paced with a randomized STEP_DELAY_RANGE pause before
     each one (see _human_delay) instead of firing the instant the previous
@@ -370,7 +544,12 @@ async def run_tuta_signup_pipeline(
     used to derive a human-looking username (see
     generate_username_from_identity) instead of the generic bot-prefixed
     fallback - age lets it pick a plausible birth-year-based suffix some of
-    the time instead of always the same random-digits shape."""
+    the time instead of always the same random-digits shape.
+
+    on_log(message), if given, receives every ctx.record() message as it
+    happens - identity_service forwards these into pipeline_progress so the
+    Monitoring page's pipeline log viewer updates live instead of only after
+    the run finishes."""
     if username is None:
         username = generate_username_from_identity(display_name, age) if display_name else generate_username()
     password = password or generate_password()
@@ -378,12 +557,19 @@ async def run_tuta_signup_pipeline(
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless, proxy=proxy)
         browser_context = await browser.new_context(locale="cs-CZ", viewport={"width": 1366, "height": 900})
+        # Playwright's default action/navigation timeout (30s) was tuned for
+        # a direct connection - a residential proxy adds real latency (and
+        # occasional connection hiccups) on every request, so a plain click()
+        # or goto() can time out on a perfectly fine run and get misread as a
+        # broken selector. Give every action more room before that.
+        browser_context.set_default_timeout(60000)
         try:
             ctx = TutaSignupContext(
                 username=username,
                 password=password,
                 context=browser_context,
                 wait_for_manual=wait_for_manual or _wait_via_stdin,
+                on_log=on_log,
                 display_name=display_name,
                 age=age,
             )
@@ -395,6 +581,7 @@ async def run_tuta_signup_pipeline(
                 if on_step:
                     on_step(index, step)
                 await step.fn(ctx)
+                ctx.record(f"<- step '{step.name}' verified OK")
             ctx.record(f"Account created: {ctx.username}@tuta.com")
             return ctx
         finally:

@@ -155,13 +155,16 @@ async def test_manual_step_resumes_via_gate_not_stdin():
 
     fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [{"name": "fake_manual_step", "manual": True}])
 
-    # Bypass proxy selection entirely - it hits the real (production, not
-    # test-isolated) Proxy table via AsyncSessionLocal, same as the identity
-    # DB-attach step below. Not what this test is about, and mutating real
-    # proxy rows' is_healthy/last_checked as a side effect of running the
-    # suite would be its own kind of test pollution.
+    # Bypass proxy selection and the pool-refresh scrape entirely - both hit
+    # real external things (the production Proxy table via AsyncSessionLocal,
+    # same as the identity DB-attach step below, and free-proxy-list.net
+    # itself) that aren't what this test is about. Real network calls in a
+    # unit test are slow/flaky/offline-unsafe, and mutating real proxy rows
+    # as a side effect of running the suite would be its own kind of test
+    # pollution.
     with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
-         patch("app.services.identity_service._select_and_test_proxy", return_value=None):
+         patch("app.services.identity_service._select_and_test_proxy", return_value=None), \
+         patch("app.services.proxy_service.import_proxies_from_free_list", return_value={"imported": 0, "skipped": 0}):
         task = asyncio.create_task(
             identity_service.start_email_pipeline_for_identity(
                 identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
@@ -197,6 +200,64 @@ async def test_resume_pipeline_returns_false_when_nothing_waiting():
 
 
 @pytest.mark.asyncio
+async def test_failed_pipeline_deletes_the_identity():
+    """A failed signup leaves no real account behind it - the identity
+    itself should be deleted (see identity_service._delete_failed_identity),
+    while the failure and its details stay visible via pipeline_progress
+    (which is self-contained - display_name/error are stored on the record
+    directly, not looked up live from the now-gone Identity row).
+
+    Uses AsyncSessionLocal directly rather than the HTTP test client: the
+    pipeline runs via start_email_pipeline_for_identity, which opens its own
+    session against the production AsyncSessionLocal (by design - the
+    request-scoped session is long closed by the time a multi-minute
+    pipeline finishes), not the test client's overridden in-memory session -
+    so creating the identity through the test client wouldn't make it
+    visible to the code under test here.
+    """
+    from app.database import AsyncSessionLocal, Base, engine
+    from app.auth.utils import hash_password
+    from app.models.identity import Identity, IdentityStatus
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with AsyncSessionLocal() as db:
+        identity = Identity(
+            display_name="Doomed Identity",
+            username=f"doomed_{uuid.uuid4().hex[:8]}",
+            password_hash=hash_password("secret123"),
+            location="US",
+            age=30,
+            status=IdentityStatus.fresh,
+        )
+        db.add(identity)
+        await db.commit()
+        await db.refresh(identity)
+        identity_id = identity.id
+
+    async def fake_run(**_):
+        raise RuntimeError("signup blew up mid-pipeline")
+
+    fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [])
+
+    with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
+         patch("app.services.identity_service._select_and_test_proxy", return_value=None), \
+         patch("app.services.proxy_service.import_proxies_from_free_list", return_value={"imported": 0, "skipped": 0}):
+        await identity_service.start_email_pipeline_for_identity(
+            identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
+        )
+
+    async with AsyncSessionLocal() as db:
+        assert await db.get(Identity, identity_id) is None
+
+    status = identity_service.get_pipeline_status(identity_id)
+    assert status["status"] == "failed"
+    assert status["display_name"] == "Doomed Identity"
+    assert "signup blew up mid-pipeline" in status["error"]
+
+
+@pytest.mark.asyncio
 async def test_two_pipelines_run_concurrently_not_one_after_another():
     """There used to be a process-wide lock serializing every pipeline run
     (back when the CAPTCHA step blocked on this process's own stdin and two
@@ -223,7 +284,8 @@ async def test_two_pipelines_run_concurrently_not_one_after_another():
     providers = {"a": fake_provider_a, "b": fake_provider_b}
 
     with patch("app.services.identity_service.get_provider_pipeline", side_effect=lambda name: providers[name]), \
-         patch("app.services.identity_service._select_and_test_proxy", return_value=None):
+         patch("app.services.identity_service._select_and_test_proxy", return_value=None), \
+         patch("app.services.proxy_service.import_proxies_from_free_list", return_value={"imported": 0, "skipped": 0}):
         task_a = asyncio.create_task(
             identity_service.start_email_pipeline_for_identity(id_a, "a", "example.com", uuid.uuid4(), "classic")
         )
@@ -287,3 +349,44 @@ async def test_concurrent_claims_never_double_assign_the_same_free_proxy():
 
     async with AsyncSessionLocal() as db:
         assert await db.get(Proxy, proxy_id) is None  # consumed either way - removed from the pool
+
+
+@pytest.mark.asyncio
+async def test_select_and_test_proxy_uses_assigned_proxy_without_retesting_or_scraping():
+    """The Identities page's generation flow now live-tests candidates itself
+    (via the same /test endpoint) and assigns one to the identity before it's
+    even created - _select_and_test_proxy should just use that directly, with
+    no re-test (check_proxy_health) and no pool-refresh scrape
+    (import_proxies_from_free_list), since re-doing work already done moments
+    ago would only slow pipeline start down for nothing."""
+    from app.database import AsyncSessionLocal, Base, engine
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    identity_id = uuid.uuid4()
+    async with AsyncSessionLocal() as db:
+        proxy = Proxy(
+            host="203.0.113.9", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+            country="US", provider="test-assigned", assigned_bot_id=identity_id,
+        )
+        db.add(proxy)
+        await db.commit()
+        await db.refresh(proxy)
+        proxy_id = proxy.id
+
+    logged = []
+    with patch("app.services.identity_service.check_proxy_health") as mock_check, \
+         patch("app.services.identity_service.proxy_service.import_proxies_from_free_list") as mock_import:
+        async with AsyncSessionLocal() as db:
+            result = await identity_service._select_and_test_proxy(db, identity_id, log=logged.append)
+
+    assert result is not None
+    assert result.id == proxy_id
+    mock_check.assert_not_called()
+    mock_import.assert_not_called()
+    assert any("no re-test or pool refresh needed" in m for m in logged)
+
+    async with AsyncSessionLocal() as db:
+        assert await db.get(Proxy, proxy_id) is None  # consumed

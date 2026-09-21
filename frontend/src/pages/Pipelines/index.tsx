@@ -3,7 +3,7 @@ import { useState, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getBots, updateBot } from '../../api/bots'
 import { createEmail, getEmailPlatforms } from '../../api/emails'
-import { continuePipeline, getAllPipelineStatus, getIdentities, type PipelineStatus } from '../../api/identities'
+import { continuePipeline, getAllPipelineStatus, type PipelineProxyInfo, type PipelineStatus } from '../../api/identities'
 import { Button } from '../../components/ui/Button'
 import type { Bot } from '../../types'
 
@@ -1497,15 +1497,24 @@ function StatusBadge({ status }: { status: PipelineStatus['status'] }) {
   )
 }
 
+function ProxyBadge({ proxy }: { proxy: PipelineProxyInfo | null }) {
+  if (!proxy) return <span className="text-[10px] text-gray-600">no proxy (direct)</span>
+  return (
+    <span className="text-[10px] px-1.5 py-0.5 rounded border border-purple-700/40 bg-purple-900/20 text-purple-300 whitespace-nowrap">
+      {proxy.type} · {proxy.host}:{proxy.port} · {proxy.country}
+    </span>
+  )
+}
+
 function EmailCreationLiveView({ providerFilter }: { providerFilter: string }) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [continuing, setContinuing] = useState<string | null>(null)
 
-  const { data: identities = [] } = useQuery({
-    queryKey: ['identities'],
-    queryFn: () => getIdentities(),
-    refetchInterval: 4000,
-  })
+  // Self-contained: reads entirely from pipeline_progress records, not a
+  // live JOIN against GET /api/identities - a failed pipeline deletes its
+  // identity (see identity_service._delete_failed_identity), but the
+  // display_name/proxy/error/logs captured on the progress record itself
+  // survive that, so a failed run stays visible and inspectable here.
   const { data: statuses = [], refetch: refetchStatuses } = useQuery({
     queryKey: ['identities-pipeline-status'],
     queryFn: () => getAllPipelineStatus(),
@@ -1522,14 +1531,9 @@ function EmailCreationLiveView({ providerFilter }: { providerFilter: string }) {
     }
   }
 
-  const statusByIdentity = new Map(statuses.map(s => [s.identity_id, s]))
+  const relevant = statuses.filter(s => !providerFilter || s.provider.toLowerCase() === providerFilter.toLowerCase())
 
-  const relevant = identities
-    .filter(i => statusByIdentity.has(i.id))
-    .filter(i => !providerFilter || statusByIdentity.get(i.id)!.provider.toLowerCase() === providerFilter.toLowerCase())
-
-  const expanded = relevant.find(i => i.id === expandedId)
-  const expandedStatus = expanded ? statusByIdentity.get(expanded.id) : undefined
+  const expandedStatus = relevant.find(s => s.identity_id === expandedId)
 
   return (
     <div className="grid grid-cols-3 gap-4">
@@ -1541,22 +1545,21 @@ function EmailCreationLiveView({ providerFilter }: { providerFilter: string }) {
             None in progress. Generate an identity on the Identities page to start one.
           </p>
         ) : (
-          relevant.map(i => {
-            const s = statusByIdentity.get(i.id)!
+          relevant.map(s => {
             const total = s.steps.length || 1
             const pct = s.status === 'completed' ? 100 : Math.round(((s.step_index + 1) / total) * 100)
             return (
               <button
-                key={i.id}
-                onClick={() => setExpandedId(expandedId === i.id ? null : i.id)}
+                key={s.identity_id}
+                onClick={() => setExpandedId(expandedId === s.identity_id ? null : s.identity_id)}
                 className={`w-full text-left rounded-lg border p-3 transition-all ${
-                  expandedId === i.id
+                  expandedId === s.identity_id
                     ? 'border-blue-700/50 bg-blue-900/20'
                     : 'border-gray-700/40 bg-gray-800/20 hover:border-gray-600/50'
                 }`}
               >
                 <div className="flex items-center justify-between mb-1 gap-2">
-                  <span className="text-sm font-medium text-gray-200 truncate">{i.display_name}</span>
+                  <span className="text-sm font-medium text-gray-200 truncate">{s.display_name ?? '(unnamed identity)'}</span>
                   <StatusBadge status={s.status} />
                 </div>
                 <div className="w-full h-1 rounded-full bg-gray-700 mb-1.5">
@@ -1565,8 +1568,11 @@ function EmailCreationLiveView({ providerFilter }: { providerFilter: string }) {
                     style={{ width: `${pct}%` }}
                   />
                 </div>
-                <div className="text-xs text-gray-600 truncate">
-                  {s.status === 'completed' ? 'Complete' : s.status === 'failed' ? (s.error ?? 'Failed') : (s.step_name?.replace(/_/g, ' ') ?? 'Starting…')}
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-xs text-gray-600 truncate">
+                    {s.status === 'completed' ? 'Complete' : s.status === 'failed' ? (s.error ?? 'Failed') : (s.step_name?.replace(/_/g, ' ') ?? 'Starting…')}
+                  </div>
+                  <ProxyBadge proxy={s.proxy} />
                 </div>
               </button>
             )
@@ -1576,19 +1582,21 @@ function EmailCreationLiveView({ providerFilter }: { providerFilter: string }) {
 
       {/* Detail */}
       <div className="col-span-2">
-        {expanded && expandedStatus ? (
+        {expandedStatus ? (
           <div className="rounded-xl border border-gray-700/50 bg-gray-800/30 p-5 space-y-4">
             <div className="flex items-start justify-between">
               <div>
-                <h3 className="text-lg font-semibold text-gray-100">{expanded.display_name}</h3>
-                <p className="text-xs text-gray-600 mt-1 flex items-center gap-2">
+                <h3 className="text-lg font-semibold text-gray-100">{expandedStatus.display_name ?? '(unnamed identity)'}</h3>
+                <p className="text-xs text-gray-600 mt-1 flex items-center gap-2 flex-wrap">
                   Provider: {expandedStatus.provider} <StatusBadge status={expandedStatus.status} />
+                  <ProxyBadge proxy={expandedStatus.proxy} />
                 </p>
               </div>
             </div>
 
             {expandedStatus.status === 'failed' && (
               <div className="rounded-lg border border-red-700/40 bg-red-900/20 p-3">
+                <p className="text-xs text-red-400 uppercase tracking-wide mb-1">Pipeline failed - identity was removed</p>
                 <p className="text-sm text-red-300">{expandedStatus.error}</p>
               </div>
             )}
@@ -1641,11 +1649,11 @@ function EmailCreationLiveView({ providerFilter }: { providerFilter: string }) {
                               Waiting for the CAPTCHA to be solved in the browser window on the machine running the backend.
                             </p>
                             <Button
-                              onClick={() => handleContinue(expanded!.id)}
-                              disabled={continuing === expanded!.id}
+                              onClick={() => handleContinue(expandedStatus.identity_id)}
+                              disabled={continuing === expandedStatus.identity_id}
                               className="text-xs"
                             >
-                              {continuing === expanded!.id ? 'Continuing…' : '✓ I solved the CAPTCHA — Continue'}
+                              {continuing === expandedStatus.identity_id ? 'Continuing…' : '✓ I solved the CAPTCHA — Continue'}
                             </Button>
                           </div>
                         )}
@@ -1658,7 +1666,7 @@ function EmailCreationLiveView({ providerFilter }: { providerFilter: string }) {
 
             {expandedStatus.status === 'completed' && (
               <div className="rounded-lg border border-emerald-700/40 bg-emerald-900/10 p-3">
-                <p className="text-sm text-emerald-300 font-semibold">✓ Mailbox created: {expanded.email}</p>
+                <p className="text-sm text-emerald-300 font-semibold">✓ Mailbox created: {expandedStatus.email}</p>
               </div>
             )}
           </div>

@@ -1,5 +1,7 @@
+import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getFleetSummary, getFleetHealth } from '../../api/platforms'
+import { getAllPipelineStatus, type PipelineStatus } from '../../api/identities'
 import { KpiCard } from '../../components/ui/KpiCard'
 import { Card } from '../../components/ui/Card'
 import { StatusDot } from '../../components/ui/StatusDot'
@@ -15,6 +17,139 @@ const mockLineData = Array.from({ length: 24 }, (_, i) => ({
   actions: Math.floor(Math.random() * 80 + 10),
   success_rate: Math.random() * 0.3 + 0.7,
 }))
+
+// ─── Email pipeline debug logs ─────────────────────────────────────────────────
+//
+// Raw Playwright/pipeline messages (step start/verify lines, proxy
+// selection, retries, the exact exception on failure) captured live by
+// app.pipelines.email_pool.progress as the signup pipeline runs, so a broken
+// run can be diagnosed here instead of digging through the backend's own
+// terminal scrollback.
+
+function pipelineRunLabel(run: PipelineStatus): string {
+  return run.display_name ?? run.email ?? `identity ${run.identity_id.slice(0, 8)}`
+}
+
+function pipelineStatusDotClass(status: PipelineStatus['status']): string {
+  switch (status) {
+    case 'completed': return 'bg-emerald-500'
+    case 'failed': return 'bg-red-500'
+    case 'waiting_manual': return 'bg-amber-400'
+    default: return 'bg-blue-400 animate-pulse'
+  }
+}
+
+function EmailPipelineLogsCard() {
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const logBoxRef = useRef<HTMLDivElement>(null)
+
+  const { data: runs = [] } = useQuery({
+    queryKey: ['identities-pipeline-status', 'monitoring'],
+    queryFn: () => getAllPipelineStatus(),
+    refetchInterval: 4000,
+  })
+
+  // Most recently updated first - a run that just failed or just logged
+  // something new should surface to the top instead of hiding among older,
+  // quiet ones.
+  const sorted = [...runs].sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+
+  useEffect(() => {
+    if (selectedId && sorted.some(r => r.identity_id === selectedId)) return
+    if (sorted.length > 0) setSelectedId(sorted[0].identity_id)
+  }, [sorted, selectedId])
+
+  const selected = sorted.find(r => r.identity_id === selectedId) ?? null
+
+  useEffect(() => {
+    logBoxRef.current?.scrollTo({ top: logBoxRef.current.scrollHeight })
+  }, [selected?.logs.length])
+
+  return (
+    <Card title="Email Pipeline Logs">
+      {sorted.length === 0 ? (
+        <p className="text-center text-gray-600 py-6 text-sm">
+          No email pipeline runs yet. Generate an identity to start one.
+        </p>
+      ) : (
+        <div className="grid grid-cols-3 gap-4">
+          <div className="col-span-1 space-y-1.5 max-h-[420px] overflow-y-auto pr-1">
+            {sorted.map(run => (
+              <button
+                key={run.identity_id}
+                onClick={() => setSelectedId(run.identity_id)}
+                className={`w-full text-left rounded-lg border px-3 py-2 transition-colors ${
+                  selectedId === run.identity_id
+                    ? 'border-blue-700/50 bg-blue-900/20'
+                    : 'border-gray-700/40 bg-gray-800/20 hover:border-gray-600/50'
+                }`}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className={`shrink-0 h-2 w-2 rounded-full ${pipelineStatusDotClass(run.status)}`} />
+                  <span className="text-sm text-gray-200 truncate">{pipelineRunLabel(run)}</span>
+                </div>
+                <p className="text-[11px] text-gray-600 truncate mt-0.5">
+                  {run.provider} · {run.status === 'failed' ? (run.error ?? 'failed') : (run.step_name?.replace(/_/g, ' ') ?? run.status)}
+                </p>
+              </button>
+            ))}
+          </div>
+
+          <div className="col-span-2">
+            {selected ? (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className={`shrink-0 h-2 w-2 rounded-full ${pipelineStatusDotClass(selected.status)}`} />
+                    <span className="text-sm font-medium text-gray-200 truncate">{pipelineRunLabel(selected)}</span>
+                    <Badge variant={selected.status === 'failed' ? 'danger' : selected.status === 'completed' ? 'success' : 'gray'} label={selected.status} />
+                  </div>
+                  {selected.proxy && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded border border-purple-700/40 bg-purple-900/20 text-purple-300 whitespace-nowrap">
+                      {selected.proxy.type} · {selected.proxy.host}:{selected.proxy.port} · {selected.proxy.country}
+                    </span>
+                  )}
+                </div>
+
+                {selected.error && (
+                  <div className="rounded-lg border border-red-700/40 bg-red-900/20 px-3 py-2">
+                    <p className="text-xs text-red-300 break-words">{selected.error}</p>
+                  </div>
+                )}
+
+                <div
+                  ref={logBoxRef}
+                  className="rounded-lg border border-gray-700/50 bg-black/40 p-3 h-[340px] overflow-y-auto font-mono text-[11px] leading-relaxed"
+                >
+                  {selected.logs.length === 0 ? (
+                    <p className="text-gray-600">No messages yet…</p>
+                  ) : (
+                    selected.logs.map((line, i) => (
+                      <p
+                        key={i}
+                        className={
+                          /rejected as invalid|Still rejected/.test(line)
+                            ? 'text-amber-400'
+                            : /verified OK|confirmed|checked|Account created|Entered mailbox/.test(line)
+                              ? 'text-emerald-400'
+                              : 'text-gray-400'
+                        }
+                      >
+                        {line}
+                      </p>
+                    ))
+                  )}
+                </div>
+              </div>
+            ) : (
+              <p className="text-center text-gray-600 py-6 text-sm">Select a run to see its messages</p>
+            )}
+          </div>
+        </div>
+      )}
+    </Card>
+  )
+}
 
 export default function MonitoringPage() {
   const { data: summary } = useQuery({ queryKey: ['fleet-summary'], queryFn: getFleetSummary, refetchInterval: 10000 })
@@ -97,6 +232,8 @@ export default function MonitoringPage() {
           )}
         </div>
       </Card>
+
+      <EmailPipelineLogsCard />
     </div>
   )
 }

@@ -11,15 +11,33 @@ export const generateIdentity = async (emailPlatformId: string) => {
   return data
 }
 
+export interface PipelineProxyInfo {
+  host: string
+  port: number
+  type: string
+  protocol: string
+  country: string
+}
+
 export interface PipelineStatus {
   identity_id: string
+  // Captured at pipeline start so this record stays self-describing even
+  // after a failed pipeline deletes the identity itself - the failure and
+  // whose it was both stay visible on the Pipelines/Monitoring pages either way.
+  display_name: string | null
   provider: string
   status: 'running' | 'waiting_manual' | 'completed' | 'failed'
   step_index: number
   step_name: string | null
   manual: boolean
   steps: { name: string; manual: boolean }[]
+  proxy: PipelineProxyInfo | null
   error: string | null
+  email: string | null
+  // Raw Playwright/pipeline log lines (timestamp-prefixed), most recent
+  // capped at MAX_LOG_LINES server-side - what the Monitoring page's
+  // pipeline log viewer renders.
+  logs: string[]
   started_at: string
   updated_at: string
 }

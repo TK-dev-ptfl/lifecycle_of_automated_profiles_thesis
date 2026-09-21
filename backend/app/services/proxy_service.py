@@ -211,8 +211,18 @@ async def import_proxies_from_free_list(db: AsyncSession) -> dict:
     """
     Fetch proxies from free-proxy-list.net and import them into the database.
     Returns a dict with counts and status.
+
+    fetch_proxies_from_free_proxy_list() is a plain sync function (httpx's
+    sync Client, BeautifulSoup parsing) that can take several seconds - run
+    via asyncio.to_thread so it doesn't block this process's single event
+    loop. That matters more now than it used to: identity_service calls this
+    at the start of every email pipeline run to refresh the pool with fresh
+    candidates, and pipelines are meant to run fully concurrently (see
+    test_two_pipelines_run_concurrently_not_one_after_another) - a blocking
+    call here would stall every other pipeline for as long as the scrape
+    takes.
     """
-    proxy_data_list = fetch_proxies_from_free_proxy_list()
+    proxy_data_list = await asyncio.to_thread(fetch_proxies_from_free_proxy_list)
     
     if not proxy_data_list:
         return {'imported': 0, 'skipped': 0, 'error': 'Failed to fetch proxies from free-proxy-list.net'}
