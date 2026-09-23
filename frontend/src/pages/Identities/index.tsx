@@ -218,6 +218,43 @@ function byMostRecentlyChecked(proxies: Proxy[]): Proxy[] {
   return [...proxies].sort((a, b) => b.last_checked.localeCompare(a.last_checked))
 }
 
+// How many candidates get live-tested concurrently at once, rather than one
+// at a time - each testProxy() call is a full round trip through the
+// backend's check_proxy_health (up to its own 10s timeout), so testing a
+// large, mostly-dead pool sequentially wastes real time waiting on dead ones
+// one by one before the next even starts.
+const PROXY_TEST_BATCH_SIZE = 20
+
+// A shared, ordered work queue that every identity's proxy search in a batch
+// generation pulls from via take() - one instance is created ONCE per
+// generateIdentitiesBatch call (not one per identity). This is what actually
+// guarantees each proxy gets tested at most once per batch: with several
+// identities searching concurrently (see BATCH_CONCURRENCY), if each one
+// independently sliced its own copy of the same candidate list, they'd all
+// compute the *same* first slice before any of them had run a single test -
+// nothing yields control back to the event loop between "read the list" and
+// "decide what to test" otherwise, so a plain shared Set of "already tried"
+// ids doesn't help here (nothing's been tried yet by the time everyone's
+// already decided what they're about to test). take() sidesteps this by
+// being the one and only place that reads AND advances the shared position,
+// synchronously, in a single step - JS's single-threaded model means that
+// can never be interrupted mid-way by another concurrent take() call, so two
+// callers can never walk away with the same candidate.
+function createProxyQueue(candidates: Proxy[]) {
+  let nextIndex = 0
+  return {
+    take(n: number): Proxy[] {
+      const slice = candidates.slice(nextIndex, nextIndex + n)
+      nextIndex += slice.length
+      return slice
+    },
+    get remaining() {
+      return candidates.length - nextIndex
+    },
+  }
+}
+type ProxyQueue = ReturnType<typeof createProxyQueue>
+
 // Live-tests candidates one at a time via the same "Test" endpoint the
 // Proxies page's own Test button uses, instead of trusting the possibly
 // stale is_healthy flag cached from the last periodic check - a proxy can
@@ -229,78 +266,48 @@ function byMostRecentlyChecked(proxies: Proxy[]): Proxy[] {
 // all a single identity ever needs (see identity_service._select_and_test_proxy
 // backend-side, which only ever consumes one anyway), so there's no reason
 // to keep testing once that's found; the caller can immediately create the
-// identity and start its pipeline. Returns null only once the entire list
-// has been tried and nothing came back alive.
+// identity and start its pipeline. Returns null only once the shared queue
+// is exhausted with nothing having come back alive.
 //
-// claimedProxyIds is shared across all identities in a batch generation (see
-// generateIdentitiesBatch) - when several identities are generated at once,
-// their selectAndVerifyProxies calls run concurrently, and without this
-// they could both test-and-pick the exact same proxy (the testProxy() calls
-// alone don't reserve anything). A candidate is skipped once claimed, and
-// claimed the instant it's confirmed alive - synchronously, before any other
-// await - so a sibling task that was testing the same candidate in parallel
-// sees it taken by the time its own test resolves and backs off instead of
-// double-claiming it. Defaults to a fresh Set for the single-identity case.
-// How many candidates get live-tested concurrently at once, rather than one
-// at a time - each testProxy() call is a full round trip through the
-// backend's check_proxy_health (up to its own 10s timeout), so testing a
-// large, mostly-dead pool sequentially wastes real time waiting on dead ones
-// one by one before the next even starts.
-const PROXY_TEST_BATCH_SIZE = 20
-
 // claimFor is an identity id generated client-side (see genId()) *before*
 // the identity actually exists - passed straight through to testProxy's
 // claim_for so a healthy candidate is atomically assigned to this exact id
 // the instant it's confirmed alive, in the same backend call that tested it.
-// This closes what used to be a real, if narrow, race: testProxy() alone
-// leaves a proxy fully unclaimed in the DB, and in the time between "we
-// tested it here" and some later request actually reserving it, a
-// completely different, already-running pipeline's own free-pool search
-// (see identity_service._select_and_test_proxy) could grab the exact same
-// proxy first - leaving the identity created moments later with nothing
-// pre-assigned despite this function having "found" one for it.
+// This closes a separate, narrower race than the queue above handles: even
+// though the queue guarantees no two identities in *this* batch ever test
+// the same candidate, a completely different, already-running pipeline (a
+// previous batch, or an existing identity's own free-pool fallback search)
+// could still claim the exact same proxy from outside this queue entirely -
+// claim_for defends against that by claiming atomically at test time rather
+// than leaving it unclaimed until a later request reserves it.
 async function selectAndVerifyProxies(
-  freeProxies: Proxy[],
+  queue: ProxyQueue,
   claimFor: string,
   onProgress?: (msg: string) => void,
-  claimedProxyIds: Set<string> = new Set(),
 ): Promise<Proxy | null> {
-  const candidates = byMostRecentlyChecked(freeProxies)
   let checked = 0
 
-  onProgress?.(`Testing ${candidates.length} proxy candidate${candidates.length !== 1 ? 's' : ''}…`)
-  for (let i = 0; i < candidates.length; i += PROXY_TEST_BATCH_SIZE) {
-    // Re-checked against claimedProxyIds here (not just once up front) -
-    // a sibling identity's own selectAndVerifyProxies call, running
-    // concurrently as part of the same batch generation, could have
-    // claimed one of these between when this batch was sliced and now.
-    const batch = candidates.slice(i, i + PROXY_TEST_BATCH_SIZE).filter(c => !claimedProxyIds.has(c.id))
-    if (batch.length === 0) continue
+  while (queue.remaining > 0) {
+    const batch = queue.take(PROXY_TEST_BATCH_SIZE)
+    if (batch.length === 0) break
 
     const results = await Promise.allSettled(batch.map(candidate => testProxy(candidate.id, claimFor)))
     checked += batch.length
 
-    // Picked in the batch's own order (not e.g. fastest-to-respond) so
-    // which proxy wins is deterministic given the same input, rather than
-    // depending on network timing noise.
-    for (let j = 0; j < results.length; j++) {
-      const result = results[j]
-      const candidate = batch[j]
+    for (const result of results) {
       if (result.status !== 'fulfilled') continue  // request itself failed - network error, hard timeout, etc.
       const tested = result.value
       if (!tested.is_healthy) continue
       if (tested.assigned_bot_id === claimFor) {
         // Confirmed: the backend actually claimed it for us, not just that
-        // it's alive - a concurrent claim_for from elsewhere could in
-        // principle still have won this exact race instead (see testProxy).
-        claimedProxyIds.add(candidate.id)
+        // it's alive - see the claim_for note above for why a concurrent
+        // claim from *outside* this batch could in principle still win it.
         onProgress?.(`Found a live proxy after checking ${checked}`)
         return tested
       }
-      // Alive, but something else's claim_for won it in the same instant -
-      // not usable for us; mark it locally too so this batch (and siblings
-      // sharing this same Set) don't waste another test call on it.
-      claimedProxyIds.add(candidate.id)
+      // Alive, but claimed by something outside this batch in the same
+      // instant - nothing more to do with it, the queue already won't hand
+      // it out again regardless.
     }
     onProgress?.(`Checked ${checked} prox${checked !== 1 ? 'ies' : 'y'} — none alive yet…`)
   }
@@ -924,13 +931,20 @@ export default function IdentitiesPage() {
     // whole point of this flow is to not act on stale data.
     const { data: freshProxies = [] } = await refetchProxies()
 
-    // Shared across every identity in this batch - see selectAndVerifyProxies's
-    // claimedProxyIds param. Without it, two of these running concurrently
-    // could both test-and-pick the exact same proxy. Proxies already
-    // committed to consumed_at on the backend never come back healthy from
-    // testProxy() again, but this is what stops two identities *within this
-    // same batch* from racing on the same still-untested candidate.
-    const claimedProxyIds = new Set<string>()
+    // Computed once for the whole batch, not once per identity - the
+    // candidate pool and its health-check results don't change per identity,
+    // so there's no reason to redo this filtering N times over.
+    const freeProxies = freshProxies.filter(p =>
+      p.is_healthy && (p.type === 'residential' || p.type === 'mobile') &&
+      !p.assigned_bot_id && !usedProxyIds.includes(p.id)
+    )
+    // One shared queue for the entire batch (not one per identity) - see
+    // createProxyQueue's own comment for why this, rather than a shared "already
+    // tried" Set, is what actually guarantees every proxy in this pool gets
+    // tested at most once across however many identities are being generated
+    // concurrently, instead of several of them redundantly testing the same
+    // candidates at the same time.
+    const proxyQueue = createProxyQueue(byMostRecentlyChecked(freeProxies))
 
     async function generateOne(index: number) {
       const onProgress = (msg: string) => onItemUpdate(index, 'running', msg)
@@ -944,11 +958,6 @@ export default function IdentitiesPage() {
       // can grab a proxy already claim_for'd to this id in between.
       const identityId = genId()
 
-      const freeProxies = freshProxies.filter(p =>
-        p.is_healthy && (p.type === 'residential' || p.type === 'mobile') &&
-        !p.assigned_bot_id && !usedProxyIds.includes(p.id) && !claimedProxyIds.has(p.id)
-      )
-
       // Any residential/mobile proxy is fair game regardless of country -
       // see selectAndVerifyProxies. Stops at the first one that tests
       // alive (one is all an identity ever needs), so as soon as this
@@ -956,7 +965,7 @@ export default function IdentitiesPage() {
       // start without waiting on anything else - sibling identities' own
       // proxy searches included, since each runs as its own independent
       // task (see the worker pool below).
-      const chosenProxy = await selectAndVerifyProxies(freeProxies, identityId, onProgress, claimedProxyIds)
+      const chosenProxy = await selectAndVerifyProxies(proxyQueue, identityId, onProgress)
       if (!chosenProxy) {
         throw new Error('No live residential/mobile proxy survived testing - try again or add more proxies.')
       }
