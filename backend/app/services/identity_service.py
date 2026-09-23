@@ -6,7 +6,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Callable, Optional
 from uuid import UUID
-from sqlalchemy import delete as sa_delete, select
+from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from app.database import AsyncSessionLocal
@@ -40,15 +40,25 @@ MAX_PROXY_CANDIDATES = 15
 
 
 async def _claim_and_consume_free_proxy(db: AsyncSession, proxy_id: UUID, identity_id: UUID) -> bool:
-    """Atomically removes this proxy from the free pool - concurrent
+    """Atomically claims this proxy out of the free pool - concurrent
     pipelines run without any process-wide lock now, so two identities could
     otherwise both see the same 'free' proxy as a candidate at the same time
-    and both try to use it. DELETE ... WHERE assigned_bot_id IS NULL is the
-    guard: whichever caller's statement actually deletes the row (rowcount
-    == 1) won the claim; the loser sees rowcount == 0 and moves on to its
-    next candidate instead of double-using the same IP for two accounts."""
+    and both try to use it. UPDATE ... WHERE assigned_bot_id IS NULL AND
+    consumed_at IS NULL is the guard: whichever caller's statement actually
+    matches a row (rowcount == 1) won the claim; the loser sees rowcount == 0
+    and moves on to its next candidate instead of double-using the same IP
+    for two accounts.
+
+    Sets consumed_at rather than deleting the row (see the Proxy model) - a
+    proxy that's ever actually been handed to a pipeline must never be
+    reused, not even after this identity is later deleted, and the row
+    needs to keep existing so import_proxies_from_free_list's host:port
+    dedup check keeps recognizing it if the exact same IP ever gets scraped
+    again."""
     result = await db.execute(
-        sa_delete(Proxy).where(Proxy.id == proxy_id, Proxy.assigned_bot_id.is_(None))
+        sa_update(Proxy)
+        .where(Proxy.id == proxy_id, Proxy.assigned_bot_id.is_(None), Proxy.consumed_at.is_(None))
+        .values(assigned_bot_id=identity_id, consumed_at=datetime.now(timezone.utc))
     )
     await db.commit()
     return result.rowcount == 1
@@ -73,8 +83,10 @@ async def _select_and_test_proxy(
     the pool has via check_proxy_health) when the identity has no such
     assigned proxy to begin with - e.g. an identity created directly through
     the API rather than the Identities page's generation flow. Either way,
-    the chosen proxy is consumed - removed from the pool entirely - so it can
-    never be reused for a second identity/account. Returns None if nothing
+    the chosen proxy is marked consumed (see the Proxy model's consumed_at)
+    rather than deleted, so it can never be reused for a second identity/
+    account - not now, and not after a later free-proxy-list scrape happens
+    to turn up the exact same host:port again. Returns None if nothing
     usable was found; caller falls back to running unproxied rather than
     blocking identity creation on a bad pool.
 
@@ -92,14 +104,20 @@ async def _select_and_test_proxy(
 
     assigned = await db.execute(
         select(Proxy)
-        .where(Proxy.assigned_bot_id == identity_id, Proxy.type.in_(ALLOWED_PROXY_TYPES))
+        .where(
+            Proxy.assigned_bot_id == identity_id,
+            Proxy.type.in_(ALLOWED_PROXY_TYPES),
+            Proxy.consumed_at.is_(None),
+        )
         .order_by(Proxy.last_checked.desc())
     )
     assigned_proxies = assigned.scalars().all()
     if assigned_proxies:
         proxy = assigned_proxies[0]
         result = await db.execute(
-            sa_delete(Proxy).where(Proxy.id == proxy.id, Proxy.assigned_bot_id == identity_id)
+            sa_update(Proxy)
+            .where(Proxy.id == proxy.id, Proxy.assigned_bot_id == identity_id, Proxy.consumed_at.is_(None))
+            .values(consumed_at=datetime.now(timezone.utc))
         )
         await db.commit()
         if result.rowcount == 1:
@@ -128,7 +146,11 @@ async def _select_and_test_proxy(
     # used before the stale ones waste a real test call.
     free = await db.execute(
         select(Proxy)
-        .where(Proxy.assigned_bot_id.is_(None), Proxy.type.in_(ALLOWED_PROXY_TYPES))
+        .where(
+            Proxy.assigned_bot_id.is_(None),
+            Proxy.type.in_(ALLOWED_PROXY_TYPES),
+            Proxy.consumed_at.is_(None),
+        )
         .order_by(Proxy.is_healthy.desc(), Proxy.last_checked.desc())
         .limit(MAX_PROXY_CANDIDATES)
     )
@@ -223,13 +245,19 @@ async def delete_identity(db: AsyncSession, identity_id: UUID) -> bool:
         for email in emails:
             email.used_by_bot_id = None
 
-        # Release proxy assignment by both relation pointers.
+        # Release proxy assignment by both relation pointers - but only ones
+        # never actually consumed by a pipeline (consumed_at is None). A
+        # consumed proxy must never be reused, not even once the identity/bot
+        # that used it is gone - releasing it here would put it right back
+        # in the free pool for someone else to pick up.
         if bot.proxy_id:
             proxy = await db.get(Proxy, bot.proxy_id)
-            if proxy:
+            if proxy and proxy.consumed_at is None:
                 proxy.assigned_bot_id = None
             bot.proxy_id = None
-        proxy_by_bot_result = await db.execute(select(Proxy).where(Proxy.assigned_bot_id == bot.id))
+        proxy_by_bot_result = await db.execute(
+            select(Proxy).where(Proxy.assigned_bot_id == bot.id, Proxy.consumed_at.is_(None))
+        )
         proxies = proxy_by_bot_result.scalars().all()
         for proxy in proxies:
             proxy.assigned_bot_id = None
@@ -238,6 +266,20 @@ async def delete_identity(db: AsyncSession, identity_id: UUID) -> bool:
         bot.identity_id = None
         bot.state = BotState.not_active
         bot.status = BotStatus.stopped
+
+    # Proxies assigned straight to the identity itself (the Identities
+    # page's generation flow does this before the identity even has a bot -
+    # see selectAndVerifyProxies in the frontend) - same never-release-once-
+    # consumed rule. Without this, an identity deleted before its pipeline
+    # ever reached the proxy step (e.g. an unsupported provider) would leak
+    # its still-unused assigned proxy forever: nothing else ever looks for
+    # proxies pointing at a since-deleted identity id, so it'd sit locked out
+    # of the pool with no way back in.
+    identity_proxies_result = await db.execute(
+        select(Proxy).where(Proxy.assigned_bot_id == identity_id, Proxy.consumed_at.is_(None))
+    )
+    for proxy in identity_proxies_result.scalars().all():
+        proxy.assigned_bot_id = None
 
     await db.delete(identity)
     return True

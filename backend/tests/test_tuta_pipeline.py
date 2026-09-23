@@ -5,7 +5,9 @@ from playwright.async_api import async_playwright
 
 from app.pipelines.email_pool.providers import tuta
 from app.pipelines.email_pool.providers.tuta import (
+    IP_BLOCKED_TEXT,
     TutaSignupContext,
+    _raise_if_ip_blocked,
     step_accept_agreements,
     step_check_recovery_kit_box,
     step_manual_captcha,
@@ -129,5 +131,40 @@ async def test_accept_agreements_raises_if_a_checkbox_does_not_actually_check():
 
             with pytest.raises(RuntimeError, match="checkbox 1 did not become checked"):
                 await step_accept_agreements(ctx)
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_raise_if_ip_blocked_detects_tuta_abuse_banner():
+    """Tuta shows this exact banner when it's blocked the signup IP for
+    suspected abuse - very commonly the proxy, especially the free/public
+    sources this pool draws from. There's nothing to retry or wait out, so
+    this must raise immediately and by name, not let the pipeline barrel on
+    into steps that assume a normal page state."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        try:
+            await page.set_content(f'<div class="text-break selectable">{IP_BLOCKED_TEXT}</div>')
+            ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page)
+
+            with pytest.raises(RuntimeError, match="Tuta blocked this IP"):
+                await _raise_if_ip_blocked(ctx)
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_raise_if_ip_blocked_does_nothing_when_banner_absent():
+    """A normal page (no abuse banner) must not trip this check."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        try:
+            await page.set_content('<div>Vitejte v Tuta</div>')
+            ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page)
+
+            await _raise_if_ip_blocked(ctx)  # must not raise
         finally:
             await browser.close()

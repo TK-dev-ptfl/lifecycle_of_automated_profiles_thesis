@@ -27,6 +27,11 @@ async def _ensure_sqlite_compat_columns() -> None:
         if "password" not in columns:
             await conn.exec_driver_sql("ALTER TABLE bots ADD COLUMN password VARCHAR(256)")
 
+        proxy_rows = await conn.exec_driver_sql("PRAGMA table_info(proxies)")
+        proxy_columns = {row[1] for row in proxy_rows.fetchall()}
+        if "consumed_at" not in proxy_columns:
+            await conn.exec_driver_sql("ALTER TABLE proxies ADD COLUMN consumed_at DATETIME")
+
         # identities.email / email_provider used to be NOT NULL; identities can
         # now exist before their mailbox does, so relax that constraint on
         # existing local databases (SQLite has no ALTER COLUMN, so rebuild the

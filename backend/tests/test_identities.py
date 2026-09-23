@@ -348,7 +348,9 @@ async def test_concurrent_claims_never_double_assign_the_same_free_proxy():
     assert {claimed_a, claimed_b} == {True, False}, "exactly one of the two concurrent claims should win"
 
     async with AsyncSessionLocal() as db:
-        assert await db.get(Proxy, proxy_id) is None  # consumed either way - removed from the pool
+        proxy = await db.get(Proxy, proxy_id)
+        assert proxy is not None  # kept, not deleted - see the Proxy model's consumed_at
+        assert proxy.consumed_at is not None
 
 
 @pytest.mark.asyncio
@@ -389,4 +391,83 @@ async def test_select_and_test_proxy_uses_assigned_proxy_without_retesting_or_sc
     assert any("no re-test or pool refresh needed" in m for m in logged)
 
     async with AsyncSessionLocal() as db:
-        assert await db.get(Proxy, proxy_id) is None  # consumed
+        proxy = await db.get(Proxy, proxy_id)
+        assert proxy is not None  # kept, not deleted - see the Proxy model's consumed_at
+        assert proxy.consumed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_consumed_proxy_never_becomes_selectable_again_even_after_identity_deleted():
+    """Regression test for exactly the failure mode reported live (Tuta
+    blocking an IP for suspected abuse): a proxy must never be handed to a
+    second pipeline once it's been used once, no matter what happens to the
+    identity that used it. Covers two ways that could otherwise leak a
+    proxy back into the pool - deleting the identity that consumed it, and a
+    later free-proxy-list scrape turning up the exact same host:port again."""
+    from app.database import AsyncSessionLocal, Base, engine
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    identity_id = uuid.uuid4()
+    async with AsyncSessionLocal() as db:
+        consumed = Proxy(
+            host="198.51.100.44", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+            country="US", provider="consumed-test", assigned_bot_id=identity_id,
+        )
+        db.add(consumed)
+        await db.commit()
+        await db.refresh(consumed)
+        proxy_id = consumed.id
+
+    with patch("app.services.identity_service.check_proxy_health"), \
+         patch("app.services.identity_service.proxy_service.import_proxies_from_free_list"):
+        async with AsyncSessionLocal() as db:
+            used = await identity_service._select_and_test_proxy(db, identity_id)
+    assert used is not None and used.id == proxy_id
+
+    # Deleting the identity that consumed it must not release it back to the
+    # pool - unlike an unconsumed assigned proxy, which delete_identity does
+    # release (see test_failed_pipeline_deletes_the_identity's sibling
+    # coverage of the un-consumed case via _delete_failed_identity).
+    async with AsyncSessionLocal() as db:
+        from app.models.identity import Identity, IdentityStatus
+        from app.auth.utils import hash_password
+        identity = Identity(
+            id=identity_id, display_name="Consumed Proxy Owner", username=f"cpo_{uuid.uuid4().hex[:8]}",
+            password_hash=hash_password("secret123"), location="US", age=30, status=IdentityStatus.fresh,
+        )
+        db.add(identity)
+        await db.commit()
+        await identity_service.delete_identity(db, identity_id)
+        await db.commit()
+
+    async with AsyncSessionLocal() as db:
+        proxy = await db.get(Proxy, proxy_id)
+        assert proxy is not None
+        # Unlike an unconsumed assigned proxy (which delete_identity does
+        # release), a consumed one is left exactly as it was - assigned_bot_id
+        # stays as a historical record of who used it, and is deliberately
+        # NOT cleared, since the only thing that actually matters for
+        # exclusivity is that consumed_at stays set forever.
+        assert proxy.assigned_bot_id == identity_id
+        assert proxy.consumed_at is not None
+
+    # A fresh scrape that happens to turn up the exact same host:port must
+    # not re-add it as if it were a new, available candidate.
+    from app.services import proxy_service as real_proxy_service
+    with patch(
+        "app.services.proxy_service.fetch_proxies_from_free_proxy_list",
+        return_value=[{
+            "host": "198.51.100.44", "port": 8080, "protocol": "http",
+            "type": "residential", "country": "US", "provider": "free-proxy-list",
+        }],
+    ):
+        async with AsyncSessionLocal() as db:
+            result = await real_proxy_service.import_proxies_from_free_list(db)
+    assert result["imported"] == 0
+    assert result["skipped"] == 1
+
+    async with AsyncSessionLocal() as db:
+        assert await db.get(Proxy, proxy_id) is not None  # still exactly one row for this host:port

@@ -220,6 +220,29 @@ def _step_error(step_name: str, message: str) -> RuntimeError:
     return RuntimeError(f"{step_name}: {message}")
 
 
+# Tuta shows this exact banner when the signup IP (in practice, almost
+# always the proxy) has been rate-limited/blocked for suspected abuse -
+# usually because it's a public/shared IP (free-proxy-list sources in
+# particular) that's already been hammered by other traffic before this
+# pipeline ever touched it. There's nothing to wait out or retry here - the
+# whole session is dead the moment this appears, so it's treated as an
+# immediate, clearly-named failure rather than being left to surface later
+# as a confusing timeout on some downstream step.
+IP_BLOCKED_TEXT = (
+    "Registrace je pro tuto IP adresu dočasně zablokována z důvodu možného "
+    "zneužití. Prosím zkuste to později nebo použijte jiné internetové připojení."
+)
+
+
+async def _raise_if_ip_blocked(ctx: TutaSignupContext) -> None:
+    assert ctx.page is not None
+    if await ctx.page.get_by_text(IP_BLOCKED_TEXT, exact=True).count() > 0:
+        raise _step_error(
+            "ip_blocked",
+            "Tuta blocked this IP for suspected abuse - closing the session",
+        )
+
+
 # --- Individual pipeline steps ------------------------------------------------
 # Each step takes the shared context, performs one action, and returns nothing
 # (it mutates ctx.page / ctx.log). Keeping them as separate functions is what
@@ -581,6 +604,12 @@ async def run_tuta_signup_pipeline(
                 if on_step:
                     on_step(index, step)
                 await step.fn(ctx)
+                # Checked after every step, not just the ones most likely to
+                # trigger it - wherever in the flow Tuta decides this IP is
+                # abusive, catching it immediately beats it quietly showing
+                # up and only being noticed as a mysterious failure two steps
+                # later.
+                await _raise_if_ip_blocked(ctx)
                 ctx.record(f"<- step '{step.name}' verified OK")
             ctx.record(f"Account created: {ctx.username}@tuta.com")
             return ctx

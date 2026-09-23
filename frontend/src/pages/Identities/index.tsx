@@ -192,42 +192,20 @@ function seedFromString(input: string): number {
 
 // ─── Proxy selection ──────────────────────────────────────────────────────────
 
-// Decides *which* country and how many proxies are needed, and hands back
-// that country's candidate pool - selectAndVerifyProxies below prefers
-// testing candidates from here first, but (per "try all proxies in the list
-// if necessary") falls back to the entire free-proxy list across every
-// country if this pool can't supply enough that are actually alive, rather
-// than failing generation just because one country's slice came up short.
-// count is decided independently of how big the pool actually is (even 0)
-// for exactly that reason - the fallback pool is what makes up the gap.
-function selectProxies(
-  requestedCC: string,         // '' = let proxies decide
-  freeProxies: Proxy[],
-): { cc: string; pool: Proxy[]; count: number } | null {
-  if (freeProxies.length === 0) return null
-
-  if (requestedCC === '') {
-    // Group by country, prefer countries we have name data for
-    const byCC: Record<string, Proxy[]> = {}
-    for (const p of freeProxies) {
-      const cc = p.country.toUpperCase()
-      if (!byCC[cc]) byCC[cc] = []
-      byCC[cc].push(p)
-    }
-    const known = Object.keys(byCC).filter(cc => COUNTRIES[cc])
-    const cc = known.length > 0 ? pick(known) : pick(Object.keys(byCC))
-    const pool = byCC[cc]
-    const count = cc === 'SK' ? randInt(2, 3) : randInt(1, 3)
-    return { cc, pool, count }
-  }
-
-  const countryPool = freeProxies.filter(p => p.country.toUpperCase() === requestedCC)
-
-  if (requestedCC === 'SK') {
-    return { cc: 'SK', pool: countryPool, count: randInt(2, 3) }
-  }
-
-  return { cc: requestedCC, pool: countryPool, count: randInt(1, 3) }
+// Picks which country flavors the *identity's own* generated data (name,
+// language, timezone, etc. - see generateIdentityData) - purely cosmetic,
+// and deliberately decoupled from which physical proxy actually gets used
+// (see selectAndVerifyProxies below): the exit IP a proxy happens to sit in
+// doesn't need to match the persona's stated country, and requiring that
+// match was only ever making proxy selection slower and more likely to fail
+// for no real benefit.
+function pickIdentityCountry(requestedCC: string, freeProxies: Proxy[]): string {
+  if (requestedCC) return requestedCC
+  const seen = Array.from(new Set(freeProxies.map(p => p.country.toUpperCase())))
+  const known = seen.filter(cc => COUNTRIES[cc])
+  if (known.length > 0) return pick(known)
+  if (seen.length > 0) return pick(seen)
+  return pick(Object.keys(COUNTRIES))
 }
 
 // Freshest health data first - a proxy's actual liveness can change within
@@ -245,12 +223,15 @@ function byMostRecentlyChecked(proxies: Proxy[]): Proxy[] {
 // stale is_healthy flag cached from the last periodic check - a proxy can
 // die between checks, and assigning a dead one to an identity would only
 // surface as a failure much later when the signup pipeline actually runs.
-// Prefers the target country's own proxies first, but if too many of those
-// turn out dead (or there aren't enough to begin with), tries every other
-// free proxy in the list regardless of country before giving up - maximizes
-// the odds generation actually succeeds instead of failing over a single
-// country's pool running dry. Returns null only if the *entire* free-proxy
-// list, tried exhaustively, still doesn't yield enough live ones.
+// Any residential/mobile proxy in the list is fair game, regardless of
+// country - see pickIdentityCountry above for why country doesn't factor in
+// here. Stops at the very first candidate that tests alive - one proxy is
+// all a single identity ever needs (see identity_service._select_and_test_proxy
+// backend-side, which only ever consumes one anyway), so there's no reason
+// to keep testing once that's found; the caller can immediately create the
+// identity and start its pipeline. Returns null only once the entire list
+// has been tried and nothing came back alive.
+//
 // claimedProxyIds is shared across all identities in a batch generation (see
 // generateIdentitiesBatch) - when several identities are generated at once,
 // their selectAndVerifyProxies calls run concurrently, and without this
@@ -261,48 +242,33 @@ function byMostRecentlyChecked(proxies: Proxy[]): Proxy[] {
 // sees it taken by the time its own test resolves and backs off instead of
 // double-claiming it. Defaults to a fresh Set for the single-identity case.
 async function selectAndVerifyProxies(
-  requestedCC: string,
   freeProxies: Proxy[],
   onProgress?: (msg: string) => void,
   claimedProxyIds: Set<string> = new Set(),
-): Promise<{ cc: string; proxies: Proxy[] } | null> {
-  const picked = selectProxies(requestedCC, freeProxies)
-  if (!picked) return null
-
-  const { cc, pool, count } = picked
-  const verified: Proxy[] = []
+): Promise<Proxy | null> {
+  const candidates = byMostRecentlyChecked(freeProxies)
   const tried = new Set<string>()
 
-  async function tryCandidates(candidates: Proxy[]) {
-    for (const candidate of byMostRecentlyChecked(candidates)) {
-      if (verified.length >= count) return
-      if (tried.has(candidate.id) || claimedProxyIds.has(candidate.id)) continue
-      tried.add(candidate.id)
-      try {
-        const tested = await testProxy(candidate.id)
-        if (tested.is_healthy && !claimedProxyIds.has(candidate.id)) {
-          claimedProxyIds.add(candidate.id)
-          verified.push(tested)
-        }
-      } catch {
-        // Test request itself failed (network error, proxy timed out hard
-        // enough to error rather than just report unhealthy) - treat the
-        // same as a failed test and move on to the next candidate.
+  onProgress?.(`Testing ${candidates.length} proxy candidate${candidates.length !== 1 ? 's' : ''}…`)
+  for (const candidate of candidates) {
+    if (tried.has(candidate.id) || claimedProxyIds.has(candidate.id)) continue
+    tried.add(candidate.id)
+    try {
+      const tested = await testProxy(candidate.id)
+      if (tested.is_healthy && !claimedProxyIds.has(candidate.id)) {
+        claimedProxyIds.add(candidate.id)
+        onProgress?.(`Found a live proxy after checking ${tried.size}`)
+        return tested
       }
-      onProgress?.(`Checked ${tried.size} prox${tried.size !== 1 ? 'ies' : 'y'} — ${verified.length}/${count} confirmed alive so far…`)
+    } catch {
+      // Test request itself failed (network error, proxy timed out hard
+      // enough to error rather than just report unhealthy) - treat the
+      // same as a failed test and move on to the next candidate.
     }
+    onProgress?.(`Checked ${tried.size} prox${tried.size !== 1 ? 'ies' : 'y'} — none alive yet…`)
   }
 
-  onProgress?.(`Testing ${pool.length} proxy candidate${pool.length !== 1 ? 's' : ''} for ${cc}…`)
-  await tryCandidates(pool)
-  if (verified.length < count) {
-    onProgress?.(`${cc} pool came up short — trying the rest of the list…`)
-    await tryCandidates(freeProxies)
-  }
-
-  if (verified.length < count) return null
-  onProgress?.(`Found ${verified.length} live prox${verified.length !== 1 ? 'ies' : 'y'}`)
-  return { cc, proxies: verified }
+  return null
 }
 
 // ─── Identity generation ──────────────────────────────────────────────────────
@@ -500,7 +466,19 @@ function Field({ label, mono, children }: { label: string; mono?: boolean; child
 
 // ─── Generate Modal ───────────────────────────────────────────────────────────
 
-const MAX_BATCH_GENERATE = 10
+// How many identities generate concurrently at once - the rest queue and
+// pick up a slot as soon as one finishes (success or failure), rather than
+// firing all of them at the same time. Keeps the load on the proxy pool
+// (and the free-proxy-list scrape/test endpoints) bounded regardless of how
+// large a batch is requested, and keeps each identity's own proxy search
+// fast (testing against a smaller in-flight contention window).
+const BATCH_CONCURRENCY = 7
+
+// Generation runs in bundles of BATCH_CONCURRENCY, so a large requested
+// count no longer means that many identities hammering the proxy pool at
+// once - this cap just guards against a wildly oversized accidental input,
+// not real concurrency.
+const MAX_BATCH_GENERATE = 50
 
 interface BatchItem {
   status: 'pending' | 'running' | 'done' | 'error'
@@ -574,7 +552,6 @@ function GenerateModal({
   })()
 
   const skCount = freeProxies.filter(p => p.country.toUpperCase() === 'SK').length
-  const skFallbackWarning = country === 'SK' && skCount < 2
 
   const canGenerate = proxyCheck.ok && !!emailPlatformId && !generating && count >= 1
 
@@ -626,7 +603,7 @@ function GenerateModal({
         {/* Batch count */}
         <div>
           <label className="text-xs text-gray-500 block mb-1.5">
-            Number of identities <span className="text-gray-700">— generated and pipelined concurrently, not one after another</span>
+            Number of identities <span className="text-gray-700">— generated in bundles of {BATCH_CONCURRENCY} at a time, the rest queue for a slot</span>
           </label>
           <input
             type="number" min={1} max={MAX_BATCH_GENERATE} value={count}
@@ -665,17 +642,11 @@ function GenerateModal({
             <span className="shrink-0 mt-0.5">{proxyCheck.ok ? '✓' : '✕'}</span>
             <span>
               {proxyCheck.ok
-                ? `${freeProxies.length} free prox${freeProxies.length !== 1 ? 'ies' : 'y'} available${country === 'SK' ? ` (${skCount} SK)` : ''}`
+                ? `${freeProxies.length} free prox${freeProxies.length !== 1 ? 'ies' : 'y'} available${country === 'SK' ? ` (${skCount} SK)` : ''}` +
+                  (count > 1 ? ` — 1 each for ${count} identities` : '')
                 : proxyCheck.msg}
             </span>
           </div>
-
-          {skFallbackWarning && (
-            <div className="flex items-start gap-2.5 rounded-lg border border-amber-700/40 bg-amber-900/10 px-3 py-2.5 text-xs text-amber-400">
-              <span className="shrink-0 mt-0.5">⚠</span>
-              <span>Only {skCount} SK prox{skCount !== 1 ? 'ies' : 'y'} available (want 2+) — will fall back to other countries' proxies if needed.</span>
-            </div>
-          )}
 
           {/* Email pipeline note */}
           <div className="flex items-start gap-2.5 rounded-lg border border-sky-700/40 bg-sky-900/10 px-3 py-2.5 text-xs text-sky-400">
@@ -879,13 +850,10 @@ export default function IdentitiesPage() {
   // IDs already committed to existing identities
   const usedProxyIds = identities.flatMap(i => i.proxy_ids ?? [])
 
-  // Generates `count` identities at once, each independently proxy-selected,
-  // created, and pipelined - all concurrently (Promise.allSettled, not
-  // sequential awaits), so N identities' email pipelines all start around
-  // the same time instead of one only beginning once the previous one's
-  // entire generation flow has finished. onItemUpdate reports each one's
-  // progress independently by index so the modal can render a live per-item
-  // list instead of one shared status line.
+  // Generates `count` identities in bundles of BATCH_CONCURRENCY, each
+  // independently proxy-selected, created, and pipelined. onItemUpdate
+  // reports each one's progress independently by index so the modal can
+  // render a live per-item list instead of one shared status line.
   async function generateIdentitiesBatch(
     requestedCountry: string,
     emailPlatformId: string,
@@ -901,7 +869,10 @@ export default function IdentitiesPage() {
 
     // Shared across every identity in this batch - see selectAndVerifyProxies's
     // claimedProxyIds param. Without it, two of these running concurrently
-    // could both test-and-pick the exact same proxy.
+    // could both test-and-pick the exact same proxy. Proxies already
+    // committed to consumed_at on the backend never come back healthy from
+    // testProxy() again, but this is what stops two identities *within this
+    // same batch* from racing on the same still-untested candidate.
     const claimedProxyIds = new Set<string>()
 
     async function generateOne(index: number) {
@@ -909,16 +880,23 @@ export default function IdentitiesPage() {
 
       const freeProxies = freshProxies.filter(p =>
         p.is_healthy && (p.type === 'residential' || p.type === 'mobile') &&
-        !p.assigned_bot_id && !usedProxyIds.includes(p.id)
+        !p.assigned_bot_id && !usedProxyIds.includes(p.id) && !claimedProxyIds.has(p.id)
       )
 
-      const proxyResult = await selectAndVerifyProxies(requestedCountry, freeProxies, onProgress, claimedProxyIds)
-      if (!proxyResult) {
-        throw new Error('No live residential/mobile proxies survived testing - try again or add more proxies.')
+      // Any residential/mobile proxy is fair game regardless of country -
+      // see selectAndVerifyProxies. Stops at the first one that tests
+      // alive (one is all an identity ever needs), so as soon as this
+      // resolves, this identity proceeds straight to creation and pipeline
+      // start without waiting on anything else - sibling identities' own
+      // proxy searches included, since each runs as its own independent
+      // task (see the worker pool below).
+      const chosenProxy = await selectAndVerifyProxies(freeProxies, onProgress, claimedProxyIds)
+      if (!chosenProxy) {
+        throw new Error('No live residential/mobile proxy survived testing - try again or add more proxies.')
       }
 
-      const { cc, proxies: chosenProxies } = proxyResult
-      const draftIdentity = generateIdentityData(cc, chosenProxies)
+      const cc = pickIdentityCountry(requestedCountry, freeProxies)
+      const draftIdentity = generateIdentityData(cc, [chosenProxy])
 
       onProgress('Creating identity…')
       // Persist identity in backend DB first, with no email - omitting it
@@ -941,15 +919,36 @@ export default function IdentitiesPage() {
         email_platform_id: emailPlatformId,
       })
 
-      onProgress('Assigning proxies & starting email pipeline…')
-      // Mark proxies as in use by this identity
-      await Promise.all(chosenProxies.map((p) => updateProxy(p.id, { assigned_bot_id: created.id })))
+      onProgress('Assigning proxy & starting email pipeline…')
+      // Exclusively this identity's own - never shared with another
+      // identity in the same batch (claimedProxyIds already prevented that
+      // above) or reused once consumed.
+      await updateProxy(chosenProxy.id, { assigned_bot_id: created.id })
 
-      onItemUpdate(index, 'done', `Started — ${draftIdentity.display_name} (${chosenProxies.length} prox${chosenProxies.length !== 1 ? 'ies' : 'y'})`)
+      onItemUpdate(index, 'done', `Started — ${draftIdentity.display_name} (proxy ${chosenProxy.host}:${chosenProxy.port})`)
     }
 
-    const results = await Promise.allSettled(
-      Array.from({ length: count }, (_, index) => generateOne(index))
+    // Concurrency-limited worker pool: BATCH_CONCURRENCY workers each pull
+    // the next not-yet-started index and run it to completion before
+    // grabbing another - so at most BATCH_CONCURRENCY identities are ever
+    // in flight, and a slot frees up (and the next queued one starts)
+    // immediately when any one finishes, rather than waiting for the whole
+    // bundle to finish together.
+    const results: PromiseSettledResult<void>[] = new Array(count)
+    let nextIndex = 0
+    async function worker() {
+      while (nextIndex < count) {
+        const index = nextIndex++
+        try {
+          await generateOne(index)
+          results[index] = { status: 'fulfilled', value: undefined }
+        } catch (err) {
+          results[index] = { status: 'rejected', reason: err }
+        }
+      }
+    }
+    await Promise.all(
+      Array.from({ length: Math.min(BATCH_CONCURRENCY, count) }, () => worker())
     )
     results.forEach((result, index) => {
       if (result.status === 'rejected') {
