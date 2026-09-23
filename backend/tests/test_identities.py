@@ -9,6 +9,20 @@ from app.pipelines.email_pool.registry import ProviderPipeline
 from app.services import identity_service
 
 
+def _fake_proxy() -> SimpleNamespace:
+    """A stand-in Proxy for tests that mock out _select_and_test_proxy - a
+    proxy is now mandatory (start_email_pipeline_for_identity refuses to run
+    a single pipeline action without one), so these can no longer just mock
+    it to return_value=None the way they used to when a proxy was optional;
+    that would make the pipeline fail before provider.run() is ever called,
+    which isn't what those tests are actually about. Has every attribute
+    _proxy_to_playwright_config and the proxy-found log line touch."""
+    return SimpleNamespace(
+        host="203.0.113.1", port=8080, username=None, password=None,
+        protocol=SimpleNamespace(value="http"), type=SimpleNamespace(value="residential"), country="US",
+    )
+
+
 @pytest.fixture
 async def email_platform(client, auth_headers):
     # Name deliberately doesn't match any entry in the automated-provider
@@ -163,7 +177,7 @@ async def test_manual_step_resumes_via_gate_not_stdin():
     # as a side effect of running the suite would be its own kind of test
     # pollution.
     with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
-         patch("app.services.identity_service._select_and_test_proxy", return_value=None), \
+         patch("app.services.identity_service._select_and_test_proxy", return_value=_fake_proxy()), \
          patch("app.services.proxy_service.import_proxies_from_free_list", return_value={"imported": 0, "skipped": 0}):
         task = asyncio.create_task(
             identity_service.start_email_pipeline_for_identity(
@@ -242,7 +256,7 @@ async def test_failed_pipeline_deletes_the_identity():
     fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [])
 
     with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
-         patch("app.services.identity_service._select_and_test_proxy", return_value=None), \
+         patch("app.services.identity_service._select_and_test_proxy", return_value=_fake_proxy()), \
          patch("app.services.proxy_service.import_proxies_from_free_list", return_value={"imported": 0, "skipped": 0}):
         await identity_service.start_email_pipeline_for_identity(
             identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
@@ -284,7 +298,7 @@ async def test_two_pipelines_run_concurrently_not_one_after_another():
     providers = {"a": fake_provider_a, "b": fake_provider_b}
 
     with patch("app.services.identity_service.get_provider_pipeline", side_effect=lambda name: providers[name]), \
-         patch("app.services.identity_service._select_and_test_proxy", return_value=None), \
+         patch("app.services.identity_service._select_and_test_proxy", return_value=_fake_proxy()), \
          patch("app.services.proxy_service.import_proxies_from_free_list", return_value={"imported": 0, "skipped": 0}):
         task_a = asyncio.create_task(
             identity_service.start_email_pipeline_for_identity(id_a, "a", "example.com", uuid.uuid4(), "classic")
@@ -471,3 +485,191 @@ async def test_consumed_proxy_never_becomes_selectable_again_even_after_identity
 
     async with AsyncSessionLocal() as db:
         assert await db.get(Proxy, proxy_id) is not None  # still exactly one row for this host:port
+
+
+@pytest.mark.asyncio
+async def test_select_and_test_proxy_keeps_retrying_across_rounds_until_one_is_alive():
+    """A proxy is mandatory - _select_and_test_proxy must not give up after a
+    single scrape+test pass just because everything tried so far was dead.
+    The query is uncapped per round now (tests every untested candidate, not
+    just a top-N slice), so to make "found on round 2" actually deterministic
+    rather than depending on how many other untested proxies this shared,
+    real, session-accumulated DB happens to already have lying around, every
+    other untested residential/mobile candidate is marked consumed first -
+    leaving exactly one real candidate, whose health only flips to alive
+    starting on the second time it's tested."""
+    from datetime import datetime, timezone
+    from sqlalchemy import update as sa_update
+    from app.database import AsyncSessionLocal, Base, engine
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            sa_update(Proxy)
+            .where(Proxy.assigned_bot_id.is_(None), Proxy.consumed_at.is_(None))
+            .values(consumed_at=datetime.now(timezone.utc))
+        )
+        await db.commit()
+
+    identity_id = uuid.uuid4()
+    async with AsyncSessionLocal() as db:
+        proxy = Proxy(
+            host="203.0.113.50", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+            country="US", provider="retry-test",
+        )
+        db.add(proxy)
+        await db.commit()
+
+    health_calls = []
+
+    def fake_check_health(host, port, protocol, **_kwargs):
+        health_calls.append(host)
+        return len(health_calls) >= 2  # dead on round 1, alive from round 2 on
+
+    with patch("app.services.identity_service.MAX_PROXY_SCRAPE_ROUNDS", 5), \
+         patch("app.services.identity_service.PROXY_SCRAPE_ROUND_DELAY_S", 0), \
+         patch("app.services.identity_service.check_proxy_health", side_effect=fake_check_health), \
+         patch(
+             "app.services.identity_service.proxy_service.import_proxies_from_free_list",
+             return_value={"imported": 0, "skipped": 0},
+         ) as mock_import:
+        async with AsyncSessionLocal() as db:
+            result = await identity_service._select_and_test_proxy(db, identity_id)
+
+    assert result is not None
+    assert result.host == "203.0.113.50"
+    assert len(health_calls) == 2  # found on round 2, never tried a 3rd round
+    assert mock_import.call_count == 2  # scraped once per round, stopped once it succeeded
+
+
+@pytest.mark.asyncio
+async def test_select_and_test_proxy_gives_up_after_round_budget_exhausted():
+    """If nothing ever comes back alive, this must still terminate (not hang
+    forever) once the round budget runs out, returning None so the caller can
+    fail the pipeline cleanly rather than running it unproxied. Same
+    isolation concern as the sibling test above - check_proxy_health is
+    patched to always return False regardless of which candidate is passed,
+    so pre-existing rows in this shared DB don't affect the outcome, only
+    how many total calls happen (which this test doesn't assert on)."""
+    from app.database import AsyncSessionLocal, Base, engine
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    identity_id = uuid.uuid4()
+    async with AsyncSessionLocal() as db:
+        proxy = Proxy(
+            host="203.0.113.51", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+            country="US", provider="retry-test-2",
+        )
+        db.add(proxy)
+        await db.commit()
+
+    with patch("app.services.identity_service.MAX_PROXY_SCRAPE_ROUNDS", 3), \
+         patch("app.services.identity_service.PROXY_SCRAPE_ROUND_DELAY_S", 0), \
+         patch("app.services.identity_service.check_proxy_health", return_value=False), \
+         patch(
+             "app.services.identity_service.proxy_service.import_proxies_from_free_list",
+             return_value={"imported": 0, "skipped": 0},
+         ) as mock_import:
+        async with AsyncSessionLocal() as db:
+            result = await identity_service._select_and_test_proxy(db, identity_id)
+
+    assert result is None
+    assert mock_import.call_count == 3  # tried every round in the budget, then stopped
+
+
+@pytest.mark.asyncio
+async def test_create_identity_with_proxy_id_claims_it_atomically():
+    """Regression test for a real race: the frontend used to create the
+    identity first, then send a *separate* follow-up PATCH to assign the
+    proxy - but the background pipeline task starts as soon as the create
+    request's response is sent, and could reach its own proxy-selection step
+    before that second request even landed, missing the already-tested
+    proxy entirely. IdentityCreate.proxy_id closes that gap by claiming the
+    proxy in the same request/transaction that creates the identity, so it's
+    guaranteed committed - and visible to a completely separate DB session,
+    exactly like the background task uses - the moment this call returns."""
+    from app.database import AsyncSessionLocal, Base, engine
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+    from app.schemas.identity import IdentityCreate
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with AsyncSessionLocal() as db:
+        proxy = Proxy(
+            host="203.0.113.90", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+            country="US", provider="atomic-claim-test",
+        )
+        db.add(proxy)
+        await db.commit()
+        await db.refresh(proxy)
+        proxy_id = proxy.id
+
+    data = IdentityCreate(
+        display_name="Atomic Claim Test", username=f"atomic_{uuid.uuid4().hex[:8]}",
+        location="US", age=30, password="secret123", proxy_id=proxy_id,
+    )
+    async with AsyncSessionLocal() as db:
+        identity = await identity_service.create_identity(db, data)
+        identity_id = identity.id
+
+    # A completely separate session - same as the one the background
+    # pipeline task actually uses - must see the claim as already committed.
+    async with AsyncSessionLocal() as fresh_db:
+        claimed = await fresh_db.get(Proxy, proxy_id)
+        assert claimed.assigned_bot_id == identity_id
+        assert claimed.consumed_at is None  # reserved, not yet consumed - the pipeline does that
+
+
+@pytest.mark.asyncio
+async def test_test_proxy_claim_for_prevents_two_identities_winning_the_same_proxy():
+    """Regression test for the race reported live: testing a proxy alone
+    used to leave it fully unclaimed until a *separate*, later request
+    reserved it - and in between, a different concurrent claim (another
+    identity's own generation flow, or a different pipeline's free-pool
+    search) could grab the exact same proxy first, despite this one having
+    "found" it moments earlier. proxy_service.test_proxy's claim_for closes
+    this by claiming atomically in the same call that confirms health -
+    fires two concurrent test-and-claim calls for two different identity ids
+    on the same proxy and asserts exactly one of them actually wins it."""
+    from app.database import AsyncSessionLocal, Base, engine
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+    from app.services import proxy_service
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with AsyncSessionLocal() as db:
+        proxy = Proxy(
+            host="203.0.113.60", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+            country="US", provider="claim-for-race-test",
+        )
+        db.add(proxy)
+        await db.commit()
+        await db.refresh(proxy)
+        proxy_id = proxy.id
+
+    id_a, id_b = uuid.uuid4(), uuid.uuid4()
+    with patch("app.services.proxy_service.check_proxy_health", return_value=True):
+        async with AsyncSessionLocal() as db_a, AsyncSessionLocal() as db_b:
+            result_a, result_b = await asyncio.gather(
+                proxy_service.test_proxy(db_a, proxy_id, claim_for=id_a),
+                proxy_service.test_proxy(db_b, proxy_id, claim_for=id_b),
+            )
+
+    # Both calls refresh from the DB after attempting their claim, so both
+    # results reflect the same actual final row - whichever claim_for really
+    # won, not necessarily each caller's own. Exactly one identity ever ends
+    # up with this proxy.
+    assert result_a.assigned_bot_id == result_b.assigned_bot_id
+    assert result_a.assigned_bot_id in (id_a, id_b)
+
+    async with AsyncSessionLocal() as db:
+        final = await db.get(Proxy, proxy_id)
+        assert final.assigned_bot_id in (id_a, id_b)

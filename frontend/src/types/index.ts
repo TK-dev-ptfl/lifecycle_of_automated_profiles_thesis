@@ -33,6 +33,13 @@ export interface Identity {
   // Write-only: which EmailPlatform to run the signup pipeline against when
   // email is omitted. Not returned by the API, only accepted on create.
   email_platform_id?: string
+  // Write-only: a proxy already live-tested and reserved for this identity
+  // by the caller. Not returned by the API, only accepted on create - the
+  // backend claims it atomically in the same request that creates the
+  // identity, so it's guaranteed in place before the background pipeline
+  // starts (see IdentityCreate.proxy_id in the backend schema for why a
+  // separate follow-up PATCH used to race the pipeline's own proxy step).
+  proxy_id?: string
   phone_number?: string
   phone_provider?: string
   profile_photo_url?: string

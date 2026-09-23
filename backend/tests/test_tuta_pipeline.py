@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import patch
 
 import pytest
@@ -9,86 +10,93 @@ from app.pipelines.email_pool.providers.tuta import (
     TutaSignupContext,
     _raise_if_ip_blocked,
     step_accept_agreements,
+    step_captcha_sleep,
     step_check_recovery_kit_box,
-    step_manual_captcha,
 )
 
-
-@pytest.mark.asyncio
-async def test_captcha_step_always_waits_for_manual_confirmation():
-    """For now step_manual_captcha always waits for a human, even when the
-    recovery-kit checkbox is already visible (which used to trigger an
-    auto-skip) - that auto-skip was racing ahead of CAPTCHAs that were still
-    loading, so every run now stops here until a person confirms."""
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        page = await (await browser.new_context()).new_page()
-        try:
-            await page.set_content('<input type="checkbox">')
-            wait_called = False
-
-            async def fake_wait(prompt: str) -> None:
-                nonlocal wait_called
-                wait_called = True
-
-            ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page, wait_for_manual=fake_wait)
-            await step_manual_captcha(ctx)
-
-            assert wait_called is True
-        finally:
-            await browser.close()
-
-
-@pytest.mark.asyncio
-async def test_captcha_step_waits_then_verifies_recovery_checkbox_appeared():
-    """No checkbox yet when the step starts - it must still wait for manual
-    confirmation, then verify (not just trust) that the recovery-kit
-    checkbox actually appeared afterward. Here fake_wait simulates a
-    correctly-solved CAPTCHA by adding the checkbox once "confirmed", so the
-    post-check should pass."""
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        page = await (await browser.new_context()).new_page()
-        try:
-            await page.set_content('<div>captcha challenge placeholder, no checkbox here</div>')
-            wait_called = False
-
-            async def fake_wait(prompt: str) -> None:
-                nonlocal wait_called
-                wait_called = True
-                # Simulate the CAPTCHA actually being solved: the recovery-kit
-                # page (with its checkbox) now appears.
-                await page.set_content('<input type="checkbox">')
-
-            ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page, wait_for_manual=fake_wait)
-            await step_manual_captcha(ctx)
-
-            assert wait_called is True
-        finally:
-            await browser.close()
-
-
-@pytest.mark.asyncio
-async def test_captcha_step_raises_when_confirmed_but_recovery_checkbox_never_appears():
-    """If the operator says "done" but the recovery-kit page never actually
-    shows up (CAPTCHA not really solved, page stuck, etc), this must not
-    silently continue as if it worked - it should raise."""
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        page = await (await browser.new_context()).new_page()
-        try:
-            await page.set_content('<div>captcha challenge placeholder, no checkbox here</div>')
-
-            async def fake_wait(prompt: str) -> None:
-                pass  # confirms "done" but never adds the checkbox - nothing changes
-
-            ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page, wait_for_manual=fake_wait)
-
-            with patch.object(tuta, "VERIFY_TIMEOUT_MS", 500), \
-                 pytest.raises(RuntimeError, match="recovery-kit page never appeared"):
-                await step_manual_captcha(ctx)
-        finally:
-            await browser.close()
+# step_manual_captcha is disabled for now (see tuta.py - swapped out for
+# step_captcha_sleep in PIPELINE_STEPS), so it's no longer importable. The
+# three tests below cover its behavior and are commented out alongside it;
+# re-enable both together.
+#
+# from app.pipelines.email_pool.providers.tuta import step_manual_captcha
+#
+#
+# @pytest.mark.asyncio
+# async def test_captcha_step_always_waits_for_manual_confirmation():
+#     """For now step_manual_captcha always waits for a human, even when the
+#     recovery-kit checkbox is already visible (which used to trigger an
+#     auto-skip) - that auto-skip was racing ahead of CAPTCHAs that were still
+#     loading, so every run now stops here until a person confirms."""
+#     async with async_playwright() as pw:
+#         browser = await pw.chromium.launch(headless=True)
+#         page = await (await browser.new_context()).new_page()
+#         try:
+#             await page.set_content('<input type="checkbox">')
+#             wait_called = False
+#
+#             async def fake_wait(prompt: str) -> None:
+#                 nonlocal wait_called
+#                 wait_called = True
+#
+#             ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page, wait_for_manual=fake_wait)
+#             await step_manual_captcha(ctx)
+#
+#             assert wait_called is True
+#         finally:
+#             await browser.close()
+#
+#
+# @pytest.mark.asyncio
+# async def test_captcha_step_waits_then_verifies_recovery_checkbox_appeared():
+#     """No checkbox yet when the step starts - it must still wait for manual
+#     confirmation, then verify (not just trust) that the recovery-kit
+#     checkbox actually appeared afterward. Here fake_wait simulates a
+#     correctly-solved CAPTCHA by adding the checkbox once "confirmed", so the
+#     post-check should pass."""
+#     async with async_playwright() as pw:
+#         browser = await pw.chromium.launch(headless=True)
+#         page = await (await browser.new_context()).new_page()
+#         try:
+#             await page.set_content('<div>captcha challenge placeholder, no checkbox here</div>')
+#             wait_called = False
+#
+#             async def fake_wait(prompt: str) -> None:
+#                 nonlocal wait_called
+#                 wait_called = True
+#                 # Simulate the CAPTCHA actually being solved: the recovery-kit
+#                 # page (with its checkbox) now appears.
+#                 await page.set_content('<input type="checkbox">')
+#
+#             ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page, wait_for_manual=fake_wait)
+#             await step_manual_captcha(ctx)
+#
+#             assert wait_called is True
+#         finally:
+#             await browser.close()
+#
+#
+# @pytest.mark.asyncio
+# async def test_captcha_step_raises_when_confirmed_but_recovery_checkbox_never_appears():
+#     """If the operator says "done" but the recovery-kit page never actually
+#     shows up (CAPTCHA not really solved, page stuck, etc), this must not
+#     silently continue as if it worked - it should raise."""
+#     async with async_playwright() as pw:
+#         browser = await pw.chromium.launch(headless=True)
+#         page = await (await browser.new_context()).new_page()
+#         try:
+#             await page.set_content('<div>captcha challenge placeholder, no checkbox here</div>')
+#
+#             async def fake_wait(prompt: str) -> None:
+#                 pass  # confirms "done" but never adds the checkbox - nothing changes
+#
+#             ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page, wait_for_manual=fake_wait)
+#
+#             with patch.object(tuta, "VERIFY_TIMEOUT_MS", 500), \
+#                  pytest.raises(RuntimeError, match="recovery-kit page never appeared"):
+#                 await step_manual_captcha(ctx)
+#         finally:
+#             await browser.close()
 
 
 @pytest.mark.asyncio
@@ -98,15 +106,45 @@ async def test_check_recovery_kit_box_raises_if_click_does_not_actually_check_it
     actually checked. A page whose checkbox resets itself on click (via
     onclick) simulates a click that doesn't register as intended - Playwright
     happily clicks it (it's a normal enabled element), but is_checked() comes
-    back False afterward, which must raise rather than be ignored."""
+    back False afterward, which must raise rather than be ignored. Includes
+    the recovery-kit page's own Continue button so the step's own
+    page-identity check (added after a *different* bug - see the
+    test_captcha_sleep_step tests below) passes and this test actually
+    reaches the checkbox-click assertion it's testing."""
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         page = await (await browser.new_context()).new_page()
         try:
-            await page.set_content('<input type="checkbox" onclick="this.checked=false">')
+            await page.set_content(
+                '<button data-testid="btn:recovery_kit_page_continue_label">Continue</button>'
+                '<input type="checkbox" onclick="this.checked=false">'
+            )
             ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page)
 
             with pytest.raises(RuntimeError, match="did not become checked"):
+                await step_check_recovery_kit_box(ctx)
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_check_recovery_kit_box_refuses_to_click_on_the_wrong_page():
+    """Regression test for the bug reported live: a checkbox belonging to a
+    different page (a CAPTCHA challenge's own "I'm not a robot" widget, or
+    the agreements page a few steps earlier) could satisfy a bare
+    "input[type=checkbox]" selector even though the pipeline never actually
+    reached the recovery-kit page. Without the recovery-kit page's own
+    Continue button present, this must refuse to click anything at all."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        try:
+            # A checkbox is present - just not on the recovery-kit page.
+            await page.set_content('<div>some other page</div><input type="checkbox">')
+            ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page)
+
+            with patch.object(tuta, "VERIFY_TIMEOUT_MS", 500), \
+                 pytest.raises(RuntimeError, match="recovery-kit page isn't actually showing"):
                 await step_check_recovery_kit_box(ctx)
         finally:
             await browser.close()
@@ -166,5 +204,63 @@ async def test_raise_if_ip_blocked_does_nothing_when_banner_absent():
             ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page)
 
             await _raise_if_ip_blocked(ctx)  # must not raise
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_captcha_sleep_step_waits_for_recovery_page_anchor_to_appear():
+    """step_manual_captcha's replacement must not just sleep-then-continue -
+    it needs to actually wait for the recovery-kit page itself to show up,
+    exactly like the disabled step used to verify after a human confirmed.
+    Anchored on the page's own Continue button rather than a bare checkbox -
+    a CAPTCHA challenge commonly renders its own checkbox widget, which would
+    otherwise satisfy a plain checkbox wait without the real recovery-kit
+    page ever having loaded (the exact bug reported live). Simulates the
+    real page appearing partway through the wait."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        try:
+            # A checkbox is already present - e.g. a CAPTCHA widget's own -
+            # but NOT the recovery-kit page's Continue button. This must not
+            # be satisfied by that checkbox alone.
+            await page.set_content('<div>captcha challenge</div><input type="checkbox">')
+            ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page)
+
+            async def add_recovery_page_shortly():
+                await asyncio.sleep(0.3)
+                await page.set_content(
+                    '<button data-testid="btn:recovery_kit_page_continue_label">Continue</button>'
+                    '<input type="checkbox">'
+                )
+
+            task = asyncio.create_task(add_recovery_page_shortly())
+            try:
+                await step_captcha_sleep(ctx)
+            finally:
+                await task
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_captcha_sleep_step_raises_if_recovery_page_never_appears():
+    """If the page never gets to the recovery-kit page (e.g. a real CAPTCHA
+    is blocking with no human to solve it, since step_manual_captcha is
+    currently disabled), this must raise rather than silently continuing
+    into step_check_recovery_kit_box against a page that was never reached.
+    A checkbox is present (as a CAPTCHA widget's might be) but the
+    recovery-kit page's own Continue button never appears."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        try:
+            await page.set_content('<div>stuck on a captcha</div><input type="checkbox">')
+            ctx = TutaSignupContext(username="x", password="y", context=page.context, page=page)
+
+            with patch.object(tuta, "CAPTCHA_AUTO_WAIT_TIMEOUT_MS", 500), \
+                 pytest.raises(RuntimeError, match="recovery-kit page never appeared"):
+                await step_captcha_sleep(ctx)
         finally:
             await browser.close()

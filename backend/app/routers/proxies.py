@@ -75,8 +75,13 @@ async def delete_proxy(proxy_id: UUID, db: AsyncSession = Depends(get_db), _: st
 
 
 @router.post("/{proxy_id}/test", response_model=ProxyResponse)
-async def test_proxy(proxy_id: UUID, db: AsyncSession = Depends(get_db), _: str = Depends(get_current_user)):
-    proxy = await proxy_service.test_proxy(db, proxy_id)
+async def test_proxy(
+    proxy_id: UUID,
+    claim_for: Optional[UUID] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(get_current_user),
+):
+    proxy = await proxy_service.test_proxy(db, proxy_id, claim_for=claim_for)
     if not proxy:
         raise HTTPException(status_code=404, detail="Proxy not found")
     return proxy

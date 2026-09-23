@@ -1497,11 +1497,34 @@ function StatusBadge({ status }: { status: PipelineStatus['status'] }) {
   )
 }
 
-function ProxyBadge({ proxy }: { proxy: PipelineProxyInfo | null }) {
-  if (!proxy) return <span className="text-[10px] text-gray-600">no proxy (direct)</span>
+// The backend never actually runs a signup without a proxy - a run with none
+// found fails and gets cleaned up before any browser action happens (see
+// identity_service.start_email_pipeline_for_identity). So a null proxy here
+// only ever means one of two very different things, and showing the same
+// "no proxy (direct)" label for both was misleading: while still running,
+// it just means the proxy search hasn't finished yet (a live pipeline was
+// never actually going unproxied, it's mid-search); on a failed run, it
+// means the search never found one and the pipeline was refused entirely.
+function ProxyBadge({ proxy, status }: { proxy: PipelineProxyInfo | null; status: PipelineStatus['status'] }) {
+  if (proxy) {
+    return (
+      <span className="text-[10px] px-1.5 py-0.5 rounded border border-purple-700/40 bg-purple-900/20 text-purple-300 whitespace-nowrap">
+        {proxy.type} · {proxy.host}:{proxy.port} · {proxy.country}
+      </span>
+    )
+  }
+  if (status === 'failed') {
+    return <span className="text-[10px] text-red-400">no proxy found - run refused</span>
+  }
+  if (status === 'completed') {
+    // Should never happen - a completed run always had a proxy. Flagged
+    // loudly rather than looking like a normal "no proxy" state.
+    return <span className="text-[10px] text-red-400">⚠ completed with no proxy recorded (unexpected)</span>
+  }
   return (
-    <span className="text-[10px] px-1.5 py-0.5 rounded border border-purple-700/40 bg-purple-900/20 text-purple-300 whitespace-nowrap">
-      {proxy.type} · {proxy.host}:{proxy.port} · {proxy.country}
+    <span className="text-[10px] text-gray-500 inline-flex items-center gap-1">
+      <span className="inline-block h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" />
+      searching for proxy…
     </span>
   )
 }
@@ -1572,7 +1595,7 @@ function EmailCreationLiveView({ providerFilter }: { providerFilter: string }) {
                   <div className="text-xs text-gray-600 truncate">
                     {s.status === 'completed' ? 'Complete' : s.status === 'failed' ? (s.error ?? 'Failed') : (s.step_name?.replace(/_/g, ' ') ?? 'Starting…')}
                   </div>
-                  <ProxyBadge proxy={s.proxy} />
+                  <ProxyBadge proxy={s.proxy} status={s.status} />
                 </div>
               </button>
             )
@@ -1589,7 +1612,7 @@ function EmailCreationLiveView({ providerFilter }: { providerFilter: string }) {
                 <h3 className="text-lg font-semibold text-gray-100">{expandedStatus.display_name ?? '(unnamed identity)'}</h3>
                 <p className="text-xs text-gray-600 mt-1 flex items-center gap-2 flex-wrap">
                   Provider: {expandedStatus.provider} <StatusBadge status={expandedStatus.status} />
-                  <ProxyBadge proxy={expandedStatus.proxy} />
+                  <ProxyBadge proxy={expandedStatus.proxy} status={expandedStatus.status} />
                 </p>
               </div>
             </div>

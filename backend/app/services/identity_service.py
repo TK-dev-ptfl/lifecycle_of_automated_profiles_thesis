@@ -31,12 +31,23 @@ from app.pipelines.email_pool.registry import get_provider_pipeline
 # prompt; that's gone now that resuming goes through a per-identity gate).
 
 PROXY_STEP_NAME = "select_and_test_proxy"
-# Pools imported from free-proxy-list-style sources are mostly dead; testing
-# every one at up to 10s/timeout each could take the better part of an hour.
-# Try known-good/most-recently-checked ones first and cap how many we bother
-# with - if none of those pan out we proceed unproxied rather than block
-# identity creation on a bad pool (see _select_and_test_proxy's return None).
-MAX_PROXY_CANDIDATES = 15
+# A proxy is mandatory - the pipeline never runs a single action unproxied
+# (see start_email_pipeline_for_identity), so _select_and_test_proxy doesn't
+# give up after one scrape+test pass either: it keeps re-scraping
+# free-proxy-list and testing whatever's untested in the pool, round after
+# round, until something comes back alive. Bounded rather than a literal
+# `while True` so a genuinely proxy-less environment fails cleanly instead of
+# hanging a background task forever.
+MAX_PROXY_SCRAPE_ROUNDS = 20
+# Re-scraping the exact same source instantly rarely turns up anything new -
+# free-proxy-list rotates on the order of minutes, not seconds - so pause
+# between rounds instead of hammering it back-to-back for no benefit.
+PROXY_SCRAPE_ROUND_DELAY_S = 4
+# How many untested candidates get health-checked concurrently at once,
+# rather than one at a time - each check_proxy_health call can take up to
+# its own 10s timeout, so testing them sequentially against a large,
+# mostly-dead pool wastes real minutes waiting on dead ones one by one.
+PROXY_TEST_BATCH_SIZE = 20
 
 
 async def _claim_and_consume_free_proxy(db: AsyncSession, proxy_id: UUID, identity_id: UUID) -> bool:
@@ -79,16 +90,21 @@ async def _select_and_test_proxy(
     pipeline start down for nothing.
 
     Only falls back to the scrape-then-select-from-the-pool flow (refreshing
-    with fresh candidates from free-proxy-list, then testing the best of what
-    the pool has via check_proxy_health) when the identity has no such
-    assigned proxy to begin with - e.g. an identity created directly through
-    the API rather than the Identities page's generation flow. Either way,
-    the chosen proxy is marked consumed (see the Proxy model's consumed_at)
-    rather than deleted, so it can never be reused for a second identity/
-    account - not now, and not after a later free-proxy-list scrape happens
-    to turn up the exact same host:port again. Returns None if nothing
-    usable was found; caller falls back to running unproxied rather than
-    blocking identity creation on a bad pool.
+    with fresh candidates from free-proxy-list, then testing what the pool
+    has via check_proxy_health) when the identity has no such assigned proxy
+    to begin with - e.g. an identity created directly through the API rather
+    than the Identities page's generation flow. That fallback doesn't give up
+    after one pass either: a proxy is mandatory (see
+    start_email_pipeline_for_identity, which refuses to run a single pipeline
+    action without one), so it keeps re-scraping and re-testing, round after
+    round (see MAX_PROXY_SCRAPE_ROUNDS), until something comes back alive or
+    the round budget runs out. No country preference anywhere in this - any
+    residential/mobile proxy is fair game regardless of the identity's own
+    country. Either way, the chosen proxy is marked consumed (see the Proxy
+    model's consumed_at) rather than deleted, so it can never be reused for a
+    second identity/account - not now, and not after a later free-proxy-list
+    scrape happens to turn up the exact same host:port again. Returns None
+    only once the entire round budget is exhausted with nothing usable found.
 
     Only residential and mobile proxies are considered (see ProxyType) -
     datacenter ranges are far more likely to already be flagged by a site's
@@ -129,42 +145,74 @@ async def _select_and_test_proxy(
             return proxy
         log("assigned proxy vanished before it could be claimed here - falling back to the pool")
 
-    # No usable pre-assigned proxy - refresh the pool with fresh candidates
-    # before picking from it (a proxy's actual liveness rots fast for this
-    # free-list source, so pulling new ones in beats only ever choosing from
-    # whatever was already sitting there).
-    refresh = await proxy_service.import_proxies_from_free_list(db)
-    if refresh.get("error"):
-        log(f"proxy pool refresh failed: {refresh['error']} - continuing with existing pool")
-    else:
-        log(f"refreshed proxy pool: {refresh.get('imported', 0)} new, {refresh.get('skipped', 0)} already known")
+    # No usable pre-assigned proxy - keep re-scraping and re-testing the pool
+    # until something comes back alive. A single pass isn't enough: a dead
+    # top-15 doesn't mean the whole pool is dead, and free-proxy-list itself
+    # can simply have nothing alive on this particular pass. country plays no
+    # part in candidate order here - any residential/mobile proxy works.
+    for round_num in range(1, MAX_PROXY_SCRAPE_ROUNDS + 1):
+        refresh = await proxy_service.import_proxies_from_free_list(db)
+        if refresh.get("error"):
+            log(f"round {round_num}/{MAX_PROXY_SCRAPE_ROUNDS}: proxy pool refresh failed: {refresh['error']} - continuing with existing pool")
+        else:
+            log(
+                f"round {round_num}/{MAX_PROXY_SCRAPE_ROUNDS}: refreshed proxy pool: "
+                f"{refresh.get('imported', 0)} new, {refresh.get('skipped', 0)} already known"
+            )
 
-    # Ordered by last_checked descending (freshest health data first) - a
-    # proxy's actual liveness can change within minutes for cheap/public
-    # sources, so a check from 5 minutes ago is far more trustworthy than one
-    # from 2 days ago, and this order means the still-accurate results get
-    # used before the stale ones waste a real test call.
-    free = await db.execute(
-        select(Proxy)
-        .where(
-            Proxy.assigned_bot_id.is_(None),
-            Proxy.type.in_(ALLOWED_PROXY_TYPES),
-            Proxy.consumed_at.is_(None),
+        # Ordered by last_checked descending (freshest health data first) - a
+        # proxy's actual liveness can change within minutes for cheap/public
+        # sources, so a check from 5 minutes ago is far more trustworthy than
+        # one from 2 days ago, and this order means the still-accurate
+        # results get used before the stale ones waste a real test call. No
+        # limit - a dead top N one round doesn't mean the rest of the pool
+        # is dead too, and giving up early is exactly what mandatory-proxy
+        # means not doing.
+        free = await db.execute(
+            select(Proxy)
+            .where(
+                Proxy.assigned_bot_id.is_(None),
+                Proxy.type.in_(ALLOWED_PROXY_TYPES),
+                Proxy.consumed_at.is_(None),
+            )
+            .order_by(Proxy.is_healthy.desc(), Proxy.last_checked.desc())
         )
-        .order_by(Proxy.is_healthy.desc(), Proxy.last_checked.desc())
-        .limit(MAX_PROXY_CANDIDATES)
-    )
-    for proxy in free.scalars().all():
-        healthy = await asyncio.to_thread(check_proxy_health, proxy.host, proxy.port, proxy.protocol.value)
-        if not healthy:
-            proxy.is_healthy = False
-            proxy.last_checked = datetime.now(timezone.utc)
-            await db.commit()
-            continue
-        if await _claim_and_consume_free_proxy(db, proxy.id, identity_id):
-            return proxy
-        # Someone else's concurrent pipeline claimed it first - try the next.
+        candidates = free.scalars().all()
+        log(f"round {round_num}/{MAX_PROXY_SCRAPE_ROUNDS}: testing {len(candidates)} untested candidate(s)")
 
+        # Tested PROXY_TEST_BATCH_SIZE at a time, concurrently, rather than
+        # one at a time - a dead/slow candidate otherwise burns its whole
+        # timeout before the next one even starts, and with a pool this size
+        # (and this unreliable) that adds up to real minutes wasted.
+        tested_count = 0
+        for batch_start in range(0, len(candidates), PROXY_TEST_BATCH_SIZE):
+            batch = candidates[batch_start:batch_start + PROXY_TEST_BATCH_SIZE]
+            healthy_flags = await asyncio.gather(*(
+                asyncio.to_thread(
+                    check_proxy_health, proxy.host, proxy.port, proxy.protocol.value,
+                    username=proxy.username, password=proxy.password,
+                )
+                for proxy in batch
+            ))
+            tested_count += len(batch)
+
+            for proxy, healthy in zip(batch, healthy_flags):
+                if not healthy:
+                    proxy.is_healthy = False
+                    proxy.last_checked = datetime.now(timezone.utc)
+                    await db.commit()
+                    continue
+                if await _claim_and_consume_free_proxy(db, proxy.id, identity_id):
+                    log(f"found a live proxy on round {round_num} after testing {tested_count} candidate(s) this round")
+                    return proxy
+                # Someone else's concurrent pipeline claimed it first - the
+                # next alive candidate in this same batch (or a later one)
+                # gets tried instead of giving up on the whole round.
+
+        if round_num < MAX_PROXY_SCRAPE_ROUNDS:
+            await asyncio.sleep(PROXY_SCRAPE_ROUND_DELAY_S)
+
+    log(f"no live residential/mobile proxy found after {MAX_PROXY_SCRAPE_ROUNDS} rounds of scraping and testing")
     return None
 
 
@@ -207,9 +255,17 @@ async def create_identity(db: AsyncSession, data: IdentityCreate) -> Identity:
         raise ValueError(f"Identity with username '{data.username}' already exists")
 
     hashed = hash_password(data.password)
-    identity = Identity(
-        **{**data.model_dump(exclude={"password", "email_platform_id"}), "password_hash": hashed}
-    )
+    identity_kwargs = {
+        **data.model_dump(exclude={"id", "password", "email_platform_id", "proxy_id"}),
+        "password_hash": hashed,
+    }
+    if data.id is not None:
+        # Caller-supplied id (see IdentityCreate.id) - only set explicitly
+        # when given, since passing id=None outright would override the
+        # column's default=uuid.uuid4 with a literal NULL instead of
+        # falling back to it.
+        identity_kwargs["id"] = data.id
+    identity = Identity(**identity_kwargs)
     db.add(identity)
     try:
         await db.flush()
@@ -217,6 +273,22 @@ async def create_identity(db: AsyncSession, data: IdentityCreate) -> Identity:
         await db.rollback()
         raise ValueError("Identity with the same email or username already exists")
     await db.refresh(identity)
+
+    if data.proxy_id is not None:
+        # Claimed atomically, in the same request/transaction that creates
+        # the identity - guaranteed committed before the background pipeline
+        # task is ever scheduled (see IdentityCreate.proxy_id). Best-effort:
+        # if this proxy was somehow already claimed or consumed by the time
+        # we get here (a real race, not the one this fixes), identity
+        # creation still succeeds - the pipeline's own _select_and_test_proxy
+        # falls back to scraping+testing the pool for a fresh one instead.
+        await db.execute(
+            sa_update(Proxy)
+            .where(Proxy.id == data.proxy_id, Proxy.assigned_bot_id.is_(None), Proxy.consumed_at.is_(None))
+            .values(assigned_bot_id=identity.id)
+        )
+        await db.commit()
+
     return identity
 
 
@@ -401,26 +473,39 @@ async def start_email_pipeline_for_identity(
             proxy = await _select_and_test_proxy(db, identity_id, log=proxy_log)
 
         if proxy is None:
-            # A missing/entirely-dead pool shouldn't block account
-            # creation - proceed unproxied (from the backend's own IP)
-            # rather than fail the whole signup over it.
-            proxy_log(f"no healthy residential/mobile proxy found (checked up to {MAX_PROXY_CANDIDATES}), continuing without one")
-            proxy_config = None
+            # No proxy, no run - not even one step. Signing up straight from
+            # the backend machine's own IP is exactly the exposure a proxy
+            # exists to prevent, so a dead/empty pool fails the pipeline
+            # outright (same cleanup as any other failure - see
+            # _delete_failed_identity) rather than quietly falling back to
+            # unproxied. provider.run() is never reached on this path.
+            error_msg = f"no healthy residential/mobile proxy available after {MAX_PROXY_SCRAPE_ROUNDS} scrape rounds - refusing to run without one"
+            proxy_log(error_msg)
             pipeline_progress.set_proxy(identity_id, None)
-        else:
-            proxy_log(
-                f"using proxy {proxy.host}:{proxy.port} "
-                f"(type={proxy.type.value}, protocol={proxy.protocol.value}, country={proxy.country}) "
-                f"- removed from the pool, will not be reused"
-            )
-            proxy_config = _proxy_to_playwright_config(proxy)
-            pipeline_progress.set_proxy(identity_id, {
-                "host": proxy.host,
-                "port": proxy.port,
-                "type": proxy.type.value,
-                "protocol": proxy.protocol.value,
-                "country": proxy.country,
-            })
+            pipeline_progress.finish(identity_id, error=error_msg)
+            await _delete_failed_identity(identity_id)
+            return
+
+        proxy_log(
+            f"using proxy {proxy.host}:{proxy.port} "
+            f"(type={proxy.type.value}, protocol={proxy.protocol.value}, country={proxy.country}) "
+            f"- removed from the pool, will not be reused"
+        )
+        proxy_config = _proxy_to_playwright_config(proxy)
+        # Belt-and-suspenders: the branch above already returns before this
+        # point whenever proxy is None, so this can never actually fire - but
+        # it makes "never run unproxied" a hard, load-bearing invariant
+        # instead of just an artifact of the current control flow, so a
+        # future edit that accidentally breaks that early return fails loudly
+        # right here instead of silently signing up from the backend's own IP.
+        assert proxy_config.get("server"), "refusing to run the pipeline with an empty proxy config"
+        pipeline_progress.set_proxy(identity_id, {
+            "host": proxy.host,
+            "port": proxy.port,
+            "type": proxy.type.value,
+            "protocol": proxy.protocol.value,
+            "country": proxy.country,
+        })
 
         try:
             result = await provider.run(

@@ -23,8 +23,20 @@ export const updateProxy = async (id: string, payload: Partial<Proxy>) => {
 
 export const deleteProxy = async (id: string) => api.delete(`/api/proxies/${id}`)
 
-export const testProxy = async (id: string) => {
-  const { data } = await api.post<Proxy>(`/api/proxies/${id}/test`)
+// claimFor, if given, is an identity id (typically generated client-side
+// before the identity itself is created - see genId() in Identities/index.tsx)
+// that this proxy gets atomically assigned to, server-side, the instant it's
+// confirmed healthy - in the same request, not a separate later one. Without
+// this, a proxy tested here sits fully unclaimed until some later call
+// reserves it, and in between a different, already-running pipeline's own
+// free-pool search could grab the exact same proxy first. Check the
+// returned Proxy's assigned_bot_id against your own claimFor rather than
+// just is_healthy - a concurrent claim can still legitimately win this race,
+// same as anywhere else this pattern is used.
+export const testProxy = async (id: string, claimFor?: string) => {
+  const { data } = await api.post<Proxy>(`/api/proxies/${id}/test`, null, {
+    params: claimFor ? { claim_for: claimFor } : undefined,
+  })
   return data
 }
 

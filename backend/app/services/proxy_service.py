@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 import httpx
 from bs4 import BeautifulSoup
@@ -171,38 +171,76 @@ async def delete_proxy(db: AsyncSession, proxy_id: UUID) -> bool:
     return True
 
 
-async def test_proxy(db: AsyncSession, proxy_id: UUID) -> Optional[Proxy]:
+async def test_proxy(db: AsyncSession, proxy_id: UUID, claim_for: Optional[UUID] = None) -> Optional[Proxy]:
+    """Live-tests a proxy and, if claim_for is given and it comes back
+    healthy, atomically claims it (assigned_bot_id) for that id in the same
+    call. This closes a real race in identity generation: testing a proxy
+    used to leave it fully unclaimed in the DB until a *separate*, later
+    createIdentity() request reserved it - and in between, nothing stopped a
+    different, already-running pipeline's own free-pool search (see
+    identity_service._select_and_test_proxy) from claiming the exact same
+    proxy first. claim_for is normally an identity id generated client-side
+    up front (before it's actually created) specifically so the claim can
+    happen the instant health is confirmed, not several awaits and one more
+    HTTP round-trip later.
+
+    The returned Proxy's assigned_bot_id reflects who *actually* ended up
+    with it (refreshed after the claim attempt) - callers should check it
+    equals their own claim_for, not just that is_healthy is true, since a
+    concurrent claim can still win the race here same as anywhere else this
+    pattern is used (see _claim_and_consume_free_proxy)."""
     proxy = await get_proxy(db, proxy_id)
     if not proxy:
         return None
-    
+
     is_healthy = await asyncio.to_thread(
         check_proxy_health,
         proxy.host,
         proxy.port,
         proxy.protocol.value,
+        username=proxy.username,
+        password=proxy.password,
     )
-    
+
     proxy.is_healthy = is_healthy
     proxy.last_checked = datetime.now(timezone.utc)
-    await db.flush()
+
+    if is_healthy and claim_for is not None:
+        await db.execute(
+            sa_update(Proxy)
+            .where(Proxy.id == proxy_id, Proxy.assigned_bot_id.is_(None), Proxy.consumed_at.is_(None))
+            .values(assigned_bot_id=claim_for)
+        )
+
+    await db.commit()
+    await db.refresh(proxy)
     return proxy
+
+
+# How many proxies get health-checked concurrently at once in test_all_proxies
+# - one at a time against a pool of hundreds (each check up to its own 10s
+# timeout) could take the better part of an hour; checking a chunk of these
+# at a time cuts that down substantially.
+TEST_ALL_BATCH_SIZE = 20
 
 
 async def test_all_proxies(db: AsyncSession) -> int:
     proxies = await get_proxies(db)
     now = datetime.now(timezone.utc)
-    
-    for proxy in proxies:
-        is_healthy = await asyncio.to_thread(
-            check_proxy_health,
-            proxy.host,
-            proxy.port,
-            proxy.protocol.value,
-        )
-        proxy.is_healthy = is_healthy
-        proxy.last_checked = now
-    
+
+    for batch_start in range(0, len(proxies), TEST_ALL_BATCH_SIZE):
+        batch = proxies[batch_start:batch_start + TEST_ALL_BATCH_SIZE]
+        healthy_flags = await asyncio.gather(*(
+            asyncio.to_thread(
+                check_proxy_health, proxy.host, proxy.port, proxy.protocol.value,
+                username=proxy.username, password=proxy.password,
+            )
+            for proxy in batch
+        ))
+        for proxy, is_healthy in zip(batch, healthy_flags):
+            proxy.is_healthy = is_healthy
+            proxy.last_checked = now
+
     await db.flush()
     return len(proxies)
 

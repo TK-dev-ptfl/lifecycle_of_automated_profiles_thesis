@@ -35,7 +35,7 @@ export default function ProxiesPage() {
 
   const inv = () => qc.invalidateQueries({ queryKey: ['proxies'] })
   const del = useMutation({ mutationFn: deleteProxy, onSuccess: inv })
-  const test = useMutation({ mutationFn: testProxy, onSuccess: inv })
+  const test = useMutation({ mutationFn: (id: string) => testProxy(id), onSuccess: inv })
   const testAll = useMutation({ mutationFn: testAllSequentially, onSuccess: inv })
   const cleanup = useMutation({ mutationFn: cleanupUnhealthyProxies, onSuccess: inv })
   const create = useMutation({ mutationFn: createProxy, onSuccess: () => { inv(); setShowCreate(false) } })

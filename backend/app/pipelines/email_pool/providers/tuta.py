@@ -54,8 +54,15 @@ STEP_DELAY_RANGE = (1.4, 3.8)
 TYPE_DELAY_RANGE_MS = (60, 150)
 # How long to wait for a step's expected resulting state (a checkbox
 # actually checked, a field appearing, a page transitioning) before treating
-# it as a real failure rather than just slow rendering.
-VERIFY_TIMEOUT_MS = 15000
+# it as a real failure rather than just slow rendering. 0 disables the
+# timeout entirely (Playwright convention) - loading through a proxy can
+# genuinely take far longer than any fixed bound accounts for, and a step
+# should never fail and close the browser just because it was still loading;
+# it waits for the real page state no matter how long that takes. The
+# try/except around each of these waits is kept in place even though it can
+# no longer actually time out, so restoring a real bound later is a one-line
+# change back to this constant.
+VERIFY_TIMEOUT_MS = 0
 
 
 async def _human_delay(min_s: float = STEP_DELAY_RANGE[0], max_s: float = STEP_DELAY_RANGE[1]) -> None:
@@ -253,9 +260,10 @@ async def _raise_if_ip_blocked(ctx: TutaSignupContext) -> None:
 
 # The very first navigation of a run is the coldest hop through a freshly
 # opened proxy connection (DNS + TCP + TLS all happening for the first time
-# through it) - gets its own extra-generous timeout on top of the context
-# default, rather than relying on that alone.
-HOMEPAGE_GOTO_TIMEOUT_MS = 90000
+# through it) - 0 disables the timeout (see VERIFY_TIMEOUT_MS above), so this
+# waits however long that takes rather than failing a perfectly fine but slow
+# proxy.
+HOMEPAGE_GOTO_TIMEOUT_MS = 0
 
 
 async def step_open_homepage(ctx: TutaSignupContext) -> None:
@@ -397,43 +405,99 @@ async def step_submit_account(ctx: TutaSignupContext) -> None:
     ctx.record("Submitted account creation form (Vytvorit ucet)")
 
 
-async def step_manual_captcha(ctx: TutaSignupContext) -> None:
-    """Tuta shows an interactive CAPTCHA here *sometimes* - not every session
-    gets challenged (depends on its own anti-bot heuristics: IP reputation,
-    fingerprint, etc). For now this always waits for a human to confirm
-    before proceeding, even on runs where the recovery-kit page would have
-    appeared on its own without a challenge - auto-skipping this step turned
-    out to be an easy way to race ahead of a CAPTCHA that was still loading,
-    so until that's more reliably distinguishable, every run stops here and
-    the browser window stays open and untouched until a person says to go.
+# Disabled for now (not registered in PIPELINE_STEPS below) - re-enable by
+# uncommenting the function body and swapping it back in for
+# step_captcha_sleep in PIPELINE_STEPS.
+# async def step_manual_captcha(ctx: TutaSignupContext) -> None:
+#     """Tuta shows an interactive CAPTCHA here *sometimes* - not every session
+#     gets challenged (depends on its own anti-bot heuristics: IP reputation,
+#     fingerprint, etc). For now this always waits for a human to confirm
+#     before proceeding, even on runs where the recovery-kit page would have
+#     appeared on its own without a challenge - auto-skipping this step turned
+#     out to be an easy way to race ahead of a CAPTCHA that was still loading,
+#     so until that's more reliably distinguishable, every run stops here and
+#     the browser window stays open and untouched until a person says to go.
+#
+#     This waits via ctx.wait_for_manual (stdin prompt for the standalone
+#     script, a dashboard button click when run through identity_service).
+#     Once the human says it's done, this does NOT just take their word for it
+#     - it re-checks that the recovery-kit page actually appeared, since a
+#     mis-solved or still-pending CAPTCHA would otherwise let the pipeline
+#     barrel on into steps that assume a page state that was never reached."""
+#     assert ctx.page is not None
+#     recovery_checkbox = ctx.page.locator(RECOVERY_KIT_CONTINUE_SELECTOR)
+#
+#     ctx.record("Waiting for manual confirmation in the browser window...")
+#     await ctx.wait_for_manual(
+#         "Solve the CAPTCHA in the browser window, then press Enter here to continue... "
+#     )
+#
+#     try:
+#         await recovery_checkbox.wait_for(state="visible", timeout=VERIFY_TIMEOUT_MS)
+#     except PlaywrightTimeoutError as exc:
+#         raise _step_error(
+#             "step_manual_captcha",
+#             "confirmed done by operator, but the recovery-kit page never appeared - "
+#             "the CAPTCHA may not actually have been solved correctly",
+#         ) from exc
+#     ctx.record("Manual CAPTCHA step confirmed done by operator, recovery kit page verified")
 
-    This waits via ctx.wait_for_manual (stdin prompt for the standalone
-    script, a dashboard button click when run through identity_service).
-    Once the human says it's done, this does NOT just take their word for it
-    - it re-checks that the recovery-kit page actually appeared, since a
-    mis-solved or still-pending CAPTCHA would otherwise let the pipeline
-    barrel on into steps that assume a page state that was never reached."""
+
+# Placeholder standing in for step_manual_captcha while it's disabled - waits
+# for the same real page-state signal that step verified after a human
+# confirmed (the recovery-kit page's checkbox actually appearing), instead of
+# a fixed sleep. A blind sleep-then-continue would move on to
+# step_check_recovery_kit_box regardless of whether the page actually got
+# there, which defeats every other step's own "verify, don't assume" rule -
+# this waits for the real transition instead. 0 disables the timeout (see
+# VERIFY_TIMEOUT_MS above): if a genuine CAPTCHA shows up with no human
+# around to solve it (step_manual_captcha is disabled), this will now wait
+# indefinitely rather than failing after a fixed window - deliberate per
+# "never timeout and close it", but means a real CAPTCHA now hangs this
+# pipeline run rather than failing it; nothing currently re-enables the
+# manual step to unblock it if that happens.
+CAPTCHA_AUTO_WAIT_TIMEOUT_MS = 0
+
+
+# The recovery-kit page's own Continue button - unlike a bare
+# "input[type=checkbox]" selector, this data-testid only ever exists on the
+# recovery-kit page itself, so it's an unambiguous anchor for "we're
+# genuinely here now". A generic checkbox selector is NOT safe to wait on for
+# this: a CAPTCHA challenge commonly renders its own checkbox (the classic
+# "I'm not a robot" widget), and the agreements page a few steps earlier has
+# checkboxes of its own too - either could satisfy a bare checkbox wait
+# without the pipeline having actually reached the recovery-kit page at all.
+RECOVERY_KIT_CONTINUE_SELECTOR = '[data-testid="btn:recovery_kit_page_continue_label"]'
+
+
+async def step_captcha_sleep(ctx: TutaSignupContext) -> None:
     assert ctx.page is not None
-    recovery_checkbox = ctx.page.locator("input[type=checkbox]").first
-
-    ctx.record("Waiting for manual confirmation in the browser window...")
-    await ctx.wait_for_manual(
-        "Solve the CAPTCHA in the browser window, then press Enter here to continue... "
-    )
-
+    recovery_page_anchor = ctx.page.locator(RECOVERY_KIT_CONTINUE_SELECTOR)
+    ctx.record("step_manual_captcha disabled - waiting for the recovery-kit page to appear on its own...")
     try:
-        await recovery_checkbox.wait_for(state="visible", timeout=VERIFY_TIMEOUT_MS)
+        await recovery_page_anchor.wait_for(state="visible", timeout=CAPTCHA_AUTO_WAIT_TIMEOUT_MS)
     except PlaywrightTimeoutError as exc:
         raise _step_error(
-            "step_manual_captcha",
-            "confirmed done by operator, but the recovery-kit page never appeared - "
-            "the CAPTCHA may not actually have been solved correctly",
+            "step_captcha_sleep",
+            "recovery-kit page never appeared - a CAPTCHA may be blocking with no human to solve it "
+            "(step_manual_captcha is currently disabled)",
         ) from exc
-    ctx.record("Manual CAPTCHA step confirmed done by operator, recovery kit page verified")
+    ctx.record("Recovery kit page appeared")
 
 
 async def step_check_recovery_kit_box(ctx: TutaSignupContext) -> None:
     assert ctx.page is not None
+    # Re-confirmed here too, not just trusted from step_captcha_sleep having
+    # already seen it - this step's whole job is clicking the right
+    # checkbox, so it re-verifies its own precondition rather than assuming
+    # the page hasn't changed since the previous step returned.
+    try:
+        await ctx.page.locator(RECOVERY_KIT_CONTINUE_SELECTOR).wait_for(state="visible", timeout=VERIFY_TIMEOUT_MS)
+    except PlaywrightTimeoutError as exc:
+        raise _step_error(
+            "step_check_recovery_kit_box",
+            "recovery-kit page isn't actually showing - refusing to click a checkbox on the wrong page",
+        ) from exc
     checkbox = ctx.page.locator("input[type=checkbox]").first
     await checkbox.click()
     if not await checkbox.is_checked():
@@ -443,7 +507,7 @@ async def step_check_recovery_kit_box(ctx: TutaSignupContext) -> None:
 
 async def step_finish_recovery_kit(ctx: TutaSignupContext) -> None:
     assert ctx.page is not None
-    continue_button = ctx.page.locator('[data-testid="btn:recovery_kit_page_continue_label"]')
+    continue_button = ctx.page.locator(RECOVERY_KIT_CONTINUE_SELECTOR)
     await continue_button.click()
     try:
         # If the click had no real effect (e.g. the checkbox wasn't actually
@@ -461,8 +525,9 @@ async def step_finish_recovery_kit(ctx: TutaSignupContext) -> None:
 
 # How long to allow for the mailbox to actually finish loading after
 # recovery-kit - Tuta generates encryption keys client-side at this point,
-# which can take a few seconds longer than a plain page navigation.
-MAILBOX_LOAD_TIMEOUT_MS = 45000
+# which can take a few seconds longer than a plain page navigation. 0
+# disables the timeout (see VERIFY_TIMEOUT_MS above).
+MAILBOX_LOAD_TIMEOUT_MS = 0
 
 
 # Disabled for now (not registered in PIPELINE_STEPS below) - re-enable by
@@ -504,7 +569,7 @@ PIPELINE_STEPS: list[PipelineStep] = [
     PipelineStep("fill_credentials", step_fill_credentials),
     PipelineStep("accept_agreements", step_accept_agreements),
     PipelineStep("submit_account", step_submit_account),
-    PipelineStep("manual_captcha", step_manual_captcha, manual=True),
+    PipelineStep("manual_captcha", step_captcha_sleep, manual=False),  # step_manual_captcha disabled, see above
     PipelineStep("check_recovery_kit_box", step_check_recovery_kit_box),
     PipelineStep("finish_recovery_kit", step_finish_recovery_kit),
     # PipelineStep("enter_mailbox", step_enter_mailbox),  # disabled for now, see step_enter_mailbox above
@@ -579,13 +644,32 @@ async def run_tuta_signup_pipeline(
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless, proxy=proxy)
-        browser_context = await browser.new_context(locale="cs-CZ", viewport={"width": 1366, "height": 900})
+        # ignore_https_errors: many proxies in this pool (free/public
+        # sources) don't properly tunnel HTTPS - they terminate the TLS
+        # connection themselves and hand back their own certificate instead
+        # of relaying tuta.com's real one, which Chromium otherwise rejects
+        # outright with ERR_CERT_AUTHORITY_INVALID before the page ever
+        # loads (not a timeout - no amount of waiting fixes it). Accepted
+        # tradeoff: a proxy doing this can also read/modify the "encrypted"
+        # traffic it's terminating, so this only makes sense because the
+        # credentials in play are throwaway ones generated for this signup,
+        # not anything sensitive reused elsewhere.
+        browser_context = await browser.new_context(
+            locale="cs-CZ", viewport={"width": 1366, "height": 900}, ignore_https_errors=True,
+        )
         # Playwright's default action/navigation timeout (30s) was tuned for
         # a direct connection - a residential proxy adds real latency (and
         # occasional connection hiccups) on every request, so a plain click()
-        # or goto() can time out on a perfectly fine run and get misread as a
-        # broken selector. Give every action more room before that.
-        browser_context.set_default_timeout(60000)
+        # or goto() could time out on a perfectly fine run and get misread as
+        # a broken selector. 0 disables the timeout entirely for every action
+        # that doesn't set its own explicit timeout - per "never timeout and
+        # close it", a step should wait for its target no matter how slowly
+        # the page is loading through whatever proxy this run landed on. The
+        # real risk this trades away: a genuinely broken selector (e.g. Tuta
+        # changes their frontend) now hangs a step forever instead of failing
+        # with a clear "never became visible" error - there's no more
+        # automatic distinction between "just slow" and "never happening".
+        browser_context.set_default_timeout(0)
         try:
             ctx = TutaSignupContext(
                 username=username,

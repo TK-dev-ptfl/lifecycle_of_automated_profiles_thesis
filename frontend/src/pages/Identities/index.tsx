@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { getProxies, updateProxy, testProxy } from '../../api/proxies'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { getProxies, updateProxy, testProxy, fetchProxiesFromFreeList } from '../../api/proxies'
 import { getEmails, getEmailPlatforms, updateEmail } from '../../api/emails'
 import { createIdentity, deleteIdentity as deleteIdentityApi, getIdentities } from '../../api/identities'
 import { Modal }  from '../../components/ui/Modal'
@@ -241,31 +241,68 @@ function byMostRecentlyChecked(proxies: Proxy[]): Proxy[] {
 // await - so a sibling task that was testing the same candidate in parallel
 // sees it taken by the time its own test resolves and backs off instead of
 // double-claiming it. Defaults to a fresh Set for the single-identity case.
+// How many candidates get live-tested concurrently at once, rather than one
+// at a time - each testProxy() call is a full round trip through the
+// backend's check_proxy_health (up to its own 10s timeout), so testing a
+// large, mostly-dead pool sequentially wastes real time waiting on dead ones
+// one by one before the next even starts.
+const PROXY_TEST_BATCH_SIZE = 20
+
+// claimFor is an identity id generated client-side (see genId()) *before*
+// the identity actually exists - passed straight through to testProxy's
+// claim_for so a healthy candidate is atomically assigned to this exact id
+// the instant it's confirmed alive, in the same backend call that tested it.
+// This closes what used to be a real, if narrow, race: testProxy() alone
+// leaves a proxy fully unclaimed in the DB, and in the time between "we
+// tested it here" and some later request actually reserving it, a
+// completely different, already-running pipeline's own free-pool search
+// (see identity_service._select_and_test_proxy) could grab the exact same
+// proxy first - leaving the identity created moments later with nothing
+// pre-assigned despite this function having "found" one for it.
 async function selectAndVerifyProxies(
   freeProxies: Proxy[],
+  claimFor: string,
   onProgress?: (msg: string) => void,
   claimedProxyIds: Set<string> = new Set(),
 ): Promise<Proxy | null> {
   const candidates = byMostRecentlyChecked(freeProxies)
-  const tried = new Set<string>()
+  let checked = 0
 
   onProgress?.(`Testing ${candidates.length} proxy candidate${candidates.length !== 1 ? 's' : ''}…`)
-  for (const candidate of candidates) {
-    if (tried.has(candidate.id) || claimedProxyIds.has(candidate.id)) continue
-    tried.add(candidate.id)
-    try {
-      const tested = await testProxy(candidate.id)
-      if (tested.is_healthy && !claimedProxyIds.has(candidate.id)) {
+  for (let i = 0; i < candidates.length; i += PROXY_TEST_BATCH_SIZE) {
+    // Re-checked against claimedProxyIds here (not just once up front) -
+    // a sibling identity's own selectAndVerifyProxies call, running
+    // concurrently as part of the same batch generation, could have
+    // claimed one of these between when this batch was sliced and now.
+    const batch = candidates.slice(i, i + PROXY_TEST_BATCH_SIZE).filter(c => !claimedProxyIds.has(c.id))
+    if (batch.length === 0) continue
+
+    const results = await Promise.allSettled(batch.map(candidate => testProxy(candidate.id, claimFor)))
+    checked += batch.length
+
+    // Picked in the batch's own order (not e.g. fastest-to-respond) so
+    // which proxy wins is deterministic given the same input, rather than
+    // depending on network timing noise.
+    for (let j = 0; j < results.length; j++) {
+      const result = results[j]
+      const candidate = batch[j]
+      if (result.status !== 'fulfilled') continue  // request itself failed - network error, hard timeout, etc.
+      const tested = result.value
+      if (!tested.is_healthy) continue
+      if (tested.assigned_bot_id === claimFor) {
+        // Confirmed: the backend actually claimed it for us, not just that
+        // it's alive - a concurrent claim_for from elsewhere could in
+        // principle still have won this exact race instead (see testProxy).
         claimedProxyIds.add(candidate.id)
-        onProgress?.(`Found a live proxy after checking ${tried.size}`)
+        onProgress?.(`Found a live proxy after checking ${checked}`)
         return tested
       }
-    } catch {
-      // Test request itself failed (network error, proxy timed out hard
-      // enough to error rather than just report unhealthy) - treat the
-      // same as a failed test and move on to the next candidate.
+      // Alive, but something else's claim_for won it in the same instant -
+      // not usable for us; mark it locally too so this batch (and siblings
+      // sharing this same Set) don't waste another test call on it.
+      claimedProxyIds.add(candidate.id)
     }
-    onProgress?.(`Checked ${tried.size} prox${tried.size !== 1 ? 'ies' : 'y'} — none alive yet…`)
+    onProgress?.(`Checked ${checked} prox${checked !== 1 ? 'ies' : 'y'} — none alive yet…`)
   }
 
   return null
@@ -820,6 +857,7 @@ function IdentityDetailModal({ identity: id, onClose }: { identity: RichIdentity
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function IdentitiesPage() {
+  const qc = useQueryClient()
   const [showGenerate, setShowGenerate]   = useState(false)
   const [preview, setPreview]             = useState<RichIdentity | null>(null)
 
@@ -860,7 +898,26 @@ export default function IdentitiesPage() {
     count: number,
     onItemUpdate: (index: number, status: 'running' | 'done' | 'error', message: string) => void,
   ) {
-    onItemUpdate(0, 'running', 'Fetching proxy pool…')
+    onItemUpdate(0, 'running', 'Fetching new proxies from the scraper…')
+    // Scrape fresh candidates from free-proxy-list before doing anything
+    // else - same source/endpoint the Proxies page's own "Fetch" button
+    // uses - rather than only ever picking from whatever this page already
+    // had cached. A failed scrape isn't fatal on its own (network hiccup,
+    // site unreachable) - there may still be usable proxies already sitting
+    // in the pool from an earlier scrape, so this logs it and carries on
+    // rather than aborting the whole batch.
+    try {
+      await fetchProxiesFromFreeList()
+    } catch (err) {
+      console.error('Proxy scrape failed, continuing with the existing pool', err)
+    }
+
+    onItemUpdate(0, 'running', 'Updating proxy list…')
+    // Invalidates every query keyed under 'proxies' (react-query matches by
+    // prefix), which includes the Proxies page's own ['proxies', healthFilter]
+    // query - so if it's open, it picks up the freshly scraped proxies too,
+    // not just this page.
+    await qc.invalidateQueries({ queryKey: ['proxies'] })
     // One fresh fetch shared by the whole batch, rather than N separate
     // ones - is_healthy/assigned_bot_id can change from other identities'
     // generation or the backend's own pipeline runs at any moment, and the
@@ -878,6 +935,15 @@ export default function IdentitiesPage() {
     async function generateOne(index: number) {
       const onProgress = (msg: string) => onItemUpdate(index, 'running', msg)
 
+      // Generated up front, before the identity exists - handed to
+      // selectAndVerifyProxies as claimFor so a proxy is atomically claimed
+      // for this exact id the moment it's confirmed alive (during the test
+      // call itself), then passed as this identity's actual id below so the
+      // two line up. Claiming this early (rather than only once
+      // createIdentity() is called) is what closes the race: nothing else
+      // can grab a proxy already claim_for'd to this id in between.
+      const identityId = genId()
+
       const freeProxies = freshProxies.filter(p =>
         p.is_healthy && (p.type === 'residential' || p.type === 'mobile') &&
         !p.assigned_bot_id && !usedProxyIds.includes(p.id) && !claimedProxyIds.has(p.id)
@@ -890,7 +956,7 @@ export default function IdentitiesPage() {
       // start without waiting on anything else - sibling identities' own
       // proxy searches included, since each runs as its own independent
       // task (see the worker pool below).
-      const chosenProxy = await selectAndVerifyProxies(freeProxies, onProgress, claimedProxyIds)
+      const chosenProxy = await selectAndVerifyProxies(freeProxies, identityId, onProgress, claimedProxyIds)
       if (!chosenProxy) {
         throw new Error('No live residential/mobile proxy survived testing - try again or add more proxies.')
       }
@@ -902,8 +968,11 @@ export default function IdentitiesPage() {
       // Persist identity in backend DB first, with no email - omitting it
       // (vs. an existing pooled address) is what tells the backend to kick
       // off the signup pipeline for the chosen provider in the background
-      // and attach a mailbox once it's done.
+      // and attach a mailbox once it's done. Created with the SAME id the
+      // proxy was already claimed for above - no separate proxy_id needed
+      // here any more, since the claim already happened during testing.
       const created = await createIdentity({
+        id: identityId,
         display_name: draftIdentity.display_name,
         username: draftIdentity.username,
         phone_number: null,
@@ -918,12 +987,6 @@ export default function IdentitiesPage() {
         password: draftIdentity.password,
         email_platform_id: emailPlatformId,
       })
-
-      onProgress('Assigning proxy & starting email pipeline…')
-      // Exclusively this identity's own - never shared with another
-      // identity in the same batch (claimedProxyIds already prevented that
-      // above) or reused once consumed.
-      await updateProxy(chosenProxy.id, { assigned_bot_id: created.id })
 
       onItemUpdate(index, 'done', `Started — ${draftIdentity.display_name} (proxy ${chosenProxy.host}:${chosenProxy.port})`)
     }
