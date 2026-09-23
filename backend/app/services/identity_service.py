@@ -31,6 +31,15 @@ from app.pipelines.email_pool.registry import get_provider_pipeline
 # prompt; that's gone now that resuming goes through a per-identity gate).
 
 PROXY_STEP_NAME = "select_and_test_proxy"
+# Hard cap on one signup session's total wall-clock time. Every individual
+# step wait inside the pipeline is deliberately unbounded (tuta.py's
+# VERIFY_TIMEOUT_MS et al. are 0 - a slow-loading page shouldn't fail a step
+# just because it's slow), but that means a session that genuinely never
+# resolves (a proxy connection that hangs instead of erroring) would
+# otherwise sit "running" forever, holding a whole Chromium instance in
+# memory. This is the outer backstop for exactly that - see the
+# asyncio.wait_for around provider.run() below.
+SESSION_TIMEOUT_S = 300
 # A proxy is mandatory - the pipeline never runs a single action unproxied
 # (see start_email_pipeline_for_identity), so _select_and_test_proxy doesn't
 # give up after one scrape+test pass either: it keeps re-scraping
@@ -508,20 +517,45 @@ async def start_email_pipeline_for_identity(
         })
 
         try:
-            result = await provider.run(
-                on_step=on_step,
-                wait_for_manual=wait_for_manual,
-                proxy=proxy_config,
-                display_name=display_name,
-                age=identity_age,
-                on_log=on_log,
+            result = await asyncio.wait_for(
+                provider.run(
+                    on_step=on_step,
+                    wait_for_manual=wait_for_manual,
+                    proxy=proxy_config,
+                    display_name=display_name,
+                    age=identity_age,
+                    on_log=on_log,
+                ),
+                timeout=SESSION_TIMEOUT_S,
             )
+        except asyncio.TimeoutError:
+            # Every per-step wait inside the pipeline itself is deliberately
+            # unbounded now (see tuta.py's VERIFY_TIMEOUT_MS - a step should
+            # wait for its target no matter how slowly the page is loading,
+            # not fail just because loading is taking a while). But an
+            # unbounded wait needs *some* outer backstop, or a session that
+            # genuinely never resolves (a truly dead proxy connection that
+            # never errors, just hangs) sits "running" forever, holding a
+            # whole Chromium instance in memory - this is that backstop, one
+            # per session, independent of anything Chrome itself does or
+            # doesn't report. asyncio.wait_for cancels the inner coroutine on
+            # timeout, which still runs run_tuta_signup_pipeline's own
+            # finally: browser.close() at its current suspension point.
+            error_msg = f"session exceeded {SESSION_TIMEOUT_S}s with no result - closed to avoid a frozen browser piling up"
+            pipeline_progress.finish(identity_id, error=error_msg)
+            print(f"[identity {identity_id}] {error_msg}")
+            await _delete_failed_identity(identity_id)
+            return
         except Exception as exc:
             # The real exception text goes straight into pipeline_progress
             # (shown on the Pipelines/Monitoring pages) rather than a generic
             # "see server logs" - a step that failed while nobody was
             # watching the terminal used to be undiagnosable from the
-            # dashboard alone.
+            # dashboard alone. This is also where a genuine Chrome-level
+            # error (a real net::ERR_* the browser itself reported, as
+            # opposed to one of our own now-disabled step timeouts) lands -
+            # tuta.py never catches those internally, so they propagate here
+            # and close the session immediately, same as any other failure.
             pipeline_progress.finish(identity_id, error=f"{type(exc).__name__}: {exc}")
             print(f"[identity {identity_id}] email pipeline failed:\n{traceback.format_exc()}")
             await _delete_failed_identity(identity_id)

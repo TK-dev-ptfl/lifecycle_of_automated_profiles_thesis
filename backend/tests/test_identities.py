@@ -673,3 +673,38 @@ async def test_test_proxy_claim_for_prevents_two_identities_winning_the_same_pro
     async with AsyncSessionLocal() as db:
         final = await db.get(Proxy, proxy_id)
         assert final.assigned_bot_id in (id_a, id_b)
+
+
+@pytest.mark.asyncio
+async def test_session_timeout_closes_a_session_that_never_resolves():
+    """Every per-step wait inside the actual Tuta pipeline is deliberately
+    unbounded (see tuta.py's VERIFY_TIMEOUT_MS), so a session whose
+    underlying connection just hangs - never errors, never resolves - needs
+    an outer backstop or it sits "running" forever, holding a browser
+    instance in memory. Simulates exactly that: a fake provider.run() that
+    never returns, with SESSION_TIMEOUT_S patched down so the test doesn't
+    actually wait 5 minutes to prove it."""
+    identity_id = uuid.uuid4()
+    reached_run = asyncio.Event()
+
+    async def fake_run(**_):
+        reached_run.set()
+        await asyncio.sleep(3600)  # never actually resolves within the test
+
+    fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [])
+
+    with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
+         patch("app.services.identity_service._select_and_test_proxy", return_value=_fake_proxy()), \
+         patch("app.services.proxy_service.import_proxies_from_free_list", return_value={"imported": 0, "skipped": 0}), \
+         patch("app.services.identity_service.SESSION_TIMEOUT_S", 0.2):
+        await asyncio.wait_for(
+            identity_service.start_email_pipeline_for_identity(
+                identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
+            ),
+            timeout=5,  # sanity bound on the test itself - should finish well under this
+        )
+
+    assert reached_run.is_set()
+    status = identity_service.get_pipeline_status(identity_id)
+    assert status["status"] == "failed"
+    assert "session exceeded" in status["error"]
