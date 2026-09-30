@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.auth.utils import get_current_user
@@ -26,12 +27,41 @@ async def list_proxies(
             "for retired=false."
         ),
     ),
+    provider: Optional[str] = Query(None, description="Only proxies from this provider (Proxy.provider)."),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(get_current_user),
 ):
     return await proxy_service.get_proxies(
-        db, type=type, country=country, is_healthy=is_healthy, assigned=assigned, retired=retired,
+        db, type=type, country=country, is_healthy=is_healthy, assigned=assigned,
+        retired=retired, provider=provider,
     )
+
+
+class ProxyProviderToggle(BaseModel):
+    is_enabled: bool
+
+
+@router.get("/providers")
+async def list_proxy_providers(db: AsyncSession = Depends(get_db), _: str = Depends(get_current_user)):
+    """Every proxy source with its on/off state and its share of the pool - what
+    the Proxies page groups by."""
+    return await proxy_service.get_proxy_providers(db)
+
+
+@router.patch("/providers/{provider_key}")
+async def toggle_proxy_provider(
+    provider_key: str,
+    body: ProxyProviderToggle,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(get_current_user),
+):
+    """Switches a source on or off for identity generation. Nothing is deleted:
+    a disabled provider's proxies stay in the pool and keep showing on the page,
+    they just stop being offered to new identities and stop being re-fetched."""
+    row = await proxy_service.set_proxy_provider_enabled(db, provider_key, body.is_enabled)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Unknown proxy provider '{provider_key}'")
+    return {"key": row.key, "is_enabled": row.is_enabled}
 
 
 @router.get("/stats")

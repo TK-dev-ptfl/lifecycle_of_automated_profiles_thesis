@@ -20,6 +20,7 @@ from app.schemas.identity import IdentityCreate, IdentityUpdate
 from app.auth.utils import hash_password
 from app.services import email_service, proxy_service
 from app.utilities.proxy_health import check_proxy_health
+from app.utilities.runtime import browser_launch_blocked_reason
 from app.pipelines.email_pool import manual_gate, progress as pipeline_progress
 from app.pipelines.email_pool.registry import get_provider_pipeline
 
@@ -278,9 +279,23 @@ async def _claim_and_consume_free_proxy(db: AsyncSession, proxy_id: UUID, identi
     needs to keep existing so import_proxies_from_free_list's host:port
     dedup check keeps recognizing it if the exact same IP ever gets scraped
     again."""
+    proxy = await db.get(Proxy, proxy_id)
+    if proxy is not None and proxy.is_rotating:
+        # A rotating endpoint is the one proxy that may serve many identities:
+        # every connection through it exits from a different IP, so reusing the
+        # row does not reuse an address. Locking or consuming it would retire the
+        # whole subscription after a single signup. Nothing to claim - it is
+        # always available, to everyone.
+        return True
+
     result = await db.execute(
         sa_update(Proxy)
-        .where(Proxy.id == proxy_id, Proxy.assigned_bot_id.is_(None), Proxy.consumed_at.is_(None))
+        .where(
+            Proxy.id == proxy_id,
+            Proxy.assigned_bot_id.is_(None),
+            Proxy.consumed_at.is_(None),
+            Proxy.is_rotating.is_(False),
+        )
         .values(assigned_bot_id=identity_id, consumed_at=datetime.now(timezone.utc))
     )
     await db.commit()
@@ -300,9 +315,20 @@ async def _reserve_free_proxy_for(db: AsyncSession, proxy_id: UUID, identity_id:
     and scraping entirely. Reserving without consuming also keeps the
     proxy recoverable - delete_identity releases an unconsumed reservation
     back to the pool if the identity never gets that far."""
+    proxy = await db.get(Proxy, proxy_id)
+    if proxy is not None and proxy.is_rotating:
+        # Nothing to reserve - see _claim_and_consume_free_proxy. A rotating
+        # endpoint is never exclusive to one identity.
+        return True
+
     result = await db.execute(
         sa_update(Proxy)
-        .where(Proxy.id == proxy_id, Proxy.assigned_bot_id.is_(None), Proxy.consumed_at.is_(None))
+        .where(
+            Proxy.id == proxy_id,
+            Proxy.assigned_bot_id.is_(None),
+            Proxy.consumed_at.is_(None),
+            Proxy.is_rotating.is_(False),
+        )
         .values(assigned_bot_id=identity_id)
     )
     await db.commit()
@@ -374,7 +400,12 @@ async def list_free_proxy_candidates(
     if allow_datacenter:
         allowed_types = allowed_types + (ProxyType.datacenter,)
 
-    result = await db.execute(
+    # A provider switched off on the Proxies page stops being offered to new
+    # identities, without its proxies being deleted - flip it back on and they
+    # are eligible again immediately.
+    disabled_providers = await proxy_service.disabled_provider_keys(db)
+
+    query = (
         select(
             Proxy.id, Proxy.host, Proxy.port, Proxy.protocol,
             Proxy.type, Proxy.username, Proxy.password,
@@ -387,6 +418,9 @@ async def list_free_proxy_candidates(
         )
         .order_by(Proxy.last_checked.desc())
     )
+    if disabled_providers:
+        query = query.where(Proxy.provider.notin_(disabled_providers))
+    result = await db.execute(query)
     return [
         ProxyCandidate(
             id=row.id, host=row.host, port=row.port,
@@ -596,7 +630,7 @@ async def _select_and_test_proxy(
         # on the next round for nothing. Later rounds make progress by importing
         # NEW candidates instead - which is also what keeps "each proxy tested
         # once" true across rounds, not just within one.
-        free = await db.execute(
+        round_query = (
             select(Proxy)
             .where(
                 Proxy.assigned_bot_id.is_(None),
@@ -606,6 +640,12 @@ async def _select_and_test_proxy(
             )
             .order_by(Proxy.last_checked.desc())
         )
+        # Same provider gate as list_free_proxy_candidates - a source switched
+        # off must not come back in through this fallback path either.
+        disabled_providers = await proxy_service.disabled_provider_keys(db)
+        if disabled_providers:
+            round_query = round_query.where(Proxy.provider.notin_(disabled_providers))
+        free = await db.execute(round_query)
         candidates = free.scalars().all()
         log(f"round {round_num}/{MAX_PROXY_SCRAPE_ROUNDS}: testing {len(candidates)} untested candidate(s)")
 
@@ -870,6 +910,17 @@ async def start_email_pipeline_for_identity(
         identity_row = await db.get(Identity, identity_id)
         display_name = identity_row.display_name if identity_row else None
         identity_age = identity_row.age if identity_row else None
+
+    # Checked before a proxy is selected, so a misconfigured server doesn't
+    # consume one proxy per attempt to tell us something knowable up front - and
+    # so the dashboard shows the actual reason instead of "NotImplementedError:".
+    blocked = browser_launch_blocked_reason()
+    if blocked is not None:
+        pipeline_progress.start(identity_id, provider_name, [], display_name=display_name)
+        pipeline_progress.finish(identity_id, error=f"cannot run a browser: {blocked}")
+        print(f"[identity {identity_id}] cannot run a browser: {blocked}")
+        await _delete_failed_identity(identity_id)
+        return
 
     try:
         provider = get_provider_pipeline(provider_name)

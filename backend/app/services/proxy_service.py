@@ -7,7 +7,9 @@ from sqlalchemy import case, delete as sa_delete, func, select, update as sa_upd
 from sqlalchemy.ext.asyncio import AsyncSession
 import httpx
 from bs4 import BeautifulSoup
+from app.config import settings
 from app.models.proxy import Proxy
+from app.models.proxy_provider import ProxyProvider
 from app.schemas.proxy import ProxyCreate, ProxyUpdate
 from app.utilities.proxy_health import check_proxy_health
 
@@ -169,6 +171,273 @@ def fetch_proxies_from_proxyscrape() -> list[dict]:
         return []
 
 
+WEBSHARE_URL = "https://proxy.webshare.io/api/v2/proxy/list/"
+# Webshare pages its list; 100 is its own maximum per page. More than a few
+# hundred proxies is far more than this pipeline needs at once, so the fetcher
+# stops after this many pages rather than walking an entire large plan.
+WEBSHARE_MAX_PAGES = 5
+
+
+def webshare_rotating_endpoint() -> Optional[dict]:
+    """Webshare's rotating ("backbone") endpoint as a single proxy entry, or None
+    when no proxy credentials are configured.
+
+    One hostname, a different exit IP on every connection - which is why it comes
+    back with is_rotating set. That flag is what stops the pipeline retiring it
+    after one signup: see the Proxy model, and
+    identity_service._claim_and_consume_free_proxy.
+    """
+    if not (settings.WEBSHARE_PROXY_USERNAME and settings.WEBSHARE_PROXY_PASSWORD):
+        return None
+    return {
+        "host": settings.WEBSHARE_PROXY_HOST,
+        "port": settings.WEBSHARE_PROXY_PORT,
+        "username": settings.WEBSHARE_PROXY_USERNAME,
+        "password": settings.WEBSHARE_PROXY_PASSWORD,
+        "protocol": "http",
+        "type": "residential",
+        # The exit IP changes per connection, so no single country describes it.
+        "country": "UN",
+        "provider": "webshare",
+        "is_rotating": True,
+    }
+
+
+def verify_webshare_rotating_endpoint() -> Optional[str]:
+    """Calls Webshare's IP echo through the rotating endpoint and returns the
+    exit IP it reported, or None if it didn't work.
+
+    Purely diagnostic - it's the cheapest way to confirm the credentials are
+    right, and calling it twice showing two different IPs is the cheapest proof
+    the endpoint really is rotating.
+    """
+    entry = webshare_rotating_endpoint()
+    if entry is None:
+        return None
+    proxy_url = f"http://{entry['username']}:{entry['password']}@{entry['host']}:{entry['port']}/"
+    try:
+        with httpx.Client(proxy=proxy_url, timeout=20.0, follow_redirects=True) as client:
+            response = client.get(settings.WEBSHARE_ECHO_URL)
+            response.raise_for_status()
+            return response.text.strip()
+    except Exception as e:
+        print(f"Webshare rotating endpoint check failed: {e}")
+        return None
+
+
+def fetch_proxies_from_webshare() -> list[dict]:
+    """Everything Webshare can give us, from either or both of its two modes.
+
+    - The rotating endpoint (proxy username/password, no API key): one entry,
+      flagged is_rotating, reusable across identities because each connection
+      exits from a different IP.
+    - The API list (API key): the account's individual fixed-IP proxies.
+
+    Webshare is the only source that returns credentials at all, which is why
+    check_proxy_health and _proxy_to_playwright_config both had to learn to pass
+    those through. Its proxies also come with a real type, so they're preferred
+    by candidate selection rather than landing in the datacenter last-resort
+    bucket.
+
+    Returns [] (with a printed reason) rather than raising when nothing is
+    configured or a call fails, so a refresh keeps whatever the other sources
+    produced - same contract as the free fetchers.
+    """
+    proxies: list[dict] = []
+
+    rotating = webshare_rotating_endpoint()
+    if rotating is not None:
+        proxies.append(rotating)
+
+    if not settings.WEBSHARE_API_KEY:
+        if not proxies:
+            print(
+                "Webshare: nothing configured, skipping. Set WEBSHARE_PROXY_USERNAME/"
+                "WEBSHARE_PROXY_PASSWORD for the rotating endpoint, or WEBSHARE_API_KEY "
+                "to list individual proxies (backend/.env)."
+            )
+        return proxies
+
+    try:
+        with httpx.Client(
+            timeout=30.0,
+            follow_redirects=True,
+            headers={"Authorization": f"Token {settings.WEBSHARE_API_KEY}"},
+        ) as client:
+            for page in range(1, WEBSHARE_MAX_PAGES + 1):
+                response = client.get(
+                    WEBSHARE_URL,
+                    params={"mode": "direct", "page": page, "page_size": 100},
+                )
+                response.raise_for_status()
+                payload = response.json()
+
+                for entry in payload.get("results") or []:
+                    # Webshare marks a proxy it knows to be down; no reason to
+                    # import one just to health-check it and throw it away.
+                    if entry.get("valid") is False:
+                        continue
+                    host = entry.get("proxy_address")
+                    port = entry.get("port")
+                    if not host or not isinstance(port, int):
+                        continue
+                    proxies.append({
+                        "host": host,
+                        "port": port,
+                        "username": entry.get("username") or None,
+                        "password": entry.get("password") or None,
+                        "protocol": "http",
+                        # Webshare sells these as residential; anything else it
+                        # returns is still better-attested than a scraped list.
+                        "type": "residential",
+                        "country": (entry.get("country_code") or "UN").upper(),
+                        "provider": "webshare",
+                    })
+
+                if not payload.get("next"):
+                    break
+
+        return proxies
+
+    except Exception as e:
+        # Keep whatever the rotating endpoint contributed - an expired API key
+        # shouldn't take the rest of Webshare down with it.
+        print(f"Error fetching the Webshare proxy list: {e}")
+        return proxies
+
+
+# Every source this system knows how to pull from, keyed by the string its
+# fetcher writes into Proxy.provider. That key is the join between a pooled
+# proxy and its provider row, which is what lets the Proxies page group by
+# source and switch a whole source off.
+# `fetch` is the NAME of the fetcher, resolved on this module at call time
+# rather than captured here as a function object. Late binding on purpose: a
+# reference frozen at import can't be patched, which silently made the fetchers
+# untestable (and let the test suite hit the live network).
+PROXY_SOURCES: dict[str, dict] = {
+    "free-proxy-list": {
+        "display_name": "free-proxy-list.net",
+        "kind": "free",
+        "fetch": "fetch_proxies_from_free_proxy_list",
+    },
+    "proxyscrape": {
+        "display_name": "proxyscrape.com",
+        "kind": "free",
+        "fetch": "fetch_proxies_from_proxyscrape",
+    },
+    "webshare": {
+        "display_name": "Webshare",
+        "kind": "paid",
+        "fetch": "fetch_proxies_from_webshare",
+    },
+}
+
+
+def _source_fetcher(key: str):
+    return globals()[PROXY_SOURCES[key]["fetch"]]
+
+# Proxies added by hand on the Proxies page. Not fetchable, but it gets a
+# provider row all the same so it can be grouped and switched off like any
+# other source.
+MANUAL_PROVIDER_KEY = "custom"
+
+
+async def seed_proxy_providers(db: AsyncSession) -> None:
+    """Creates the provider rows for every known source, once. Idempotent, and
+    deliberately does not touch is_enabled on rows that already exist - that's
+    the user's setting, and a server restart must not silently switch a source
+    they turned off back on."""
+    existing = set((await db.execute(select(ProxyProvider.key))).scalars().all())
+
+    wanted = [
+        (key, meta["display_name"], meta["kind"]) for key, meta in PROXY_SOURCES.items()
+    ] + [(MANUAL_PROVIDER_KEY, "Added manually", "manual")]
+
+    for key, display_name, kind in wanted:
+        if key not in existing:
+            db.add(ProxyProvider(key=key, display_name=display_name, kind=kind, is_enabled=True))
+    await db.commit()
+
+
+async def get_proxy_providers(db: AsyncSession) -> list[dict]:
+    """Every provider with its on/off state and how many proxies it currently
+    accounts for, which is what the Proxies page groups by.
+
+    Providers with no row of their own (a one-off string typed into the Add
+    Proxy form) are still listed, as enabled - see disabled_provider_keys for
+    why absence means enabled rather than unknown."""
+    rows = (await db.execute(select(ProxyProvider).order_by(ProxyProvider.key))).scalars().all()
+    by_key = {row.key: row for row in rows}
+
+    counts = await db.execute(
+        select(
+            Proxy.provider,
+            func.count(Proxy.id),
+            func.sum(case((Proxy.consumed_at.isnot(None), 1), else_=0)),
+            func.sum(case(((Proxy.consumed_at.is_(None)) & (Proxy.is_healthy.is_(True)), 1), else_=0)),
+        ).group_by(Proxy.provider)
+    )
+    stats = {
+        provider: {
+            "total": total or 0,
+            "retired": int(retired or 0),
+            "available": (total or 0) - int(retired or 0),
+            "available_healthy": int(healthy or 0),
+        }
+        for provider, total, retired, healthy in counts.all()
+    }
+
+    providers = []
+    for key in sorted(set(by_key) | set(stats)):
+        row = by_key.get(key)
+        meta = PROXY_SOURCES.get(key, {})
+        providers.append({
+            "key": key,
+            "display_name": row.display_name if row else key,
+            "kind": row.kind if row else "manual",
+            "is_enabled": row.is_enabled if row else True,
+            "can_fetch": key in PROXY_SOURCES,
+            # Surfaced so the page can explain a paid source sitting at zero
+            # rather than leaving it looking broken.
+            "needs_api_key": key == "webshare" and not settings.WEBSHARE_API_KEY,
+            **stats.get(key, {"total": 0, "retired": 0, "available": 0, "available_healthy": 0}),
+        })
+    return providers
+
+
+async def set_proxy_provider_enabled(db: AsyncSession, key: str, is_enabled: bool) -> Optional[ProxyProvider]:
+    """Turns a provider on or off. Creates the row if this provider only existed
+    as a string on some proxies until now, so an ad-hoc source can be switched
+    off too."""
+    row = (await db.execute(select(ProxyProvider).where(ProxyProvider.key == key))).scalar_one_or_none()
+    if row is None:
+        known = await db.execute(select(Proxy.provider).where(Proxy.provider == key).limit(1))
+        if known.scalar_one_or_none() is None and key not in PROXY_SOURCES:
+            return None
+        meta = PROXY_SOURCES.get(key, {})
+        row = ProxyProvider(
+            key=key,
+            display_name=meta.get("display_name", key),
+            kind=meta.get("kind", "manual"),
+        )
+        db.add(row)
+    row.is_enabled = is_enabled
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def disabled_provider_keys(db: AsyncSession) -> set[str]:
+    """Providers explicitly switched off.
+
+    Returns what to EXCLUDE rather than what to allow, on purpose: a provider
+    with no row - a proxy added by hand under some new name, or a source added
+    to the code before its row is seeded - is then treated as usable instead of
+    silently invisible. Only an explicit "off" hides anything."""
+    rows = await db.execute(select(ProxyProvider.key).where(ProxyProvider.is_enabled.is_(False)))
+    return set(rows.scalars().all())
+
+
 async def get_proxies(
     db: AsyncSession,
     type: Optional[str] = None,
@@ -176,6 +445,7 @@ async def get_proxies(
     is_healthy: Optional[bool] = None,
     assigned: Optional[bool] = None,
     retired: Optional[bool] = None,
+    provider: Optional[str] = None,
 ) -> list:
     """retired filters on consumed_at: True = only proxies permanently out of
     circulation (used by a pipeline, or retired after failing in real use),
@@ -198,6 +468,8 @@ async def get_proxies(
         q = q.where(Proxy.consumed_at.isnot(None))
     elif retired is False:
         q = q.where(Proxy.consumed_at.is_(None))
+    if provider:
+        q = q.where(Proxy.provider == provider)
     result = await db.execute(q)
     return result.scalars().all()
 
@@ -363,7 +635,7 @@ async def import_proxies_from_free_list(db: AsyncSession) -> dict:
     check (below) handles the rare case of the same proxy appearing in both
     sources transparently.
     """
-    proxy_data_list = await fetch_all_free_proxies()
+    proxy_data_list = await fetch_all_free_proxies(db)
 
     if not proxy_data_list:
         return {'imported': 0, 'skipped': 0, 'error': 'Failed to fetch proxies from any configured source (free-proxy-list.net, proxyscrape.com)'}
@@ -379,16 +651,30 @@ async def import_proxies_from_free_list(db: AsyncSession) -> dict:
     return {'imported': imported, 'skipped': skipped, 'message': f'Successfully imported {imported} proxies'}
 
 
-async def fetch_all_free_proxies() -> list[dict]:
-    """Scrapes every configured free source concurrently and returns the
-    merged, unfiltered result. Split out of import_proxies_from_free_list so
-    replace_free_proxy_pool can scrape *before* it throws the old list away -
-    see the ordering note there."""
-    proxy_data_list, proxyscrape_list = await asyncio.gather(
-        asyncio.to_thread(fetch_proxies_from_free_proxy_list),
-        asyncio.to_thread(fetch_proxies_from_proxyscrape),
-    )
-    return proxy_data_list + proxyscrape_list
+async def fetch_all_free_proxies(db: Optional[AsyncSession] = None) -> list[dict]:
+    """Fetches from every ENABLED source concurrently and returns the merged,
+    unfiltered result. Split out of import_proxies_from_free_list so
+    replace_free_proxy_pool can fetch *before* it throws the old list away - see
+    the ordering note there.
+
+    A disabled provider isn't fetched at all: leaving it out here is what stops
+    a source you switched off from quietly refilling the pool every two minutes.
+    With no session given, nothing is treated as disabled - the fetchers
+    themselves don't need the database, and this keeps them testable in
+    isolation.
+    """
+    disabled = await disabled_provider_keys(db) if db is not None else set()
+    active = [(key, meta) for key, meta in PROXY_SOURCES.items() if key not in disabled]
+    if not active:
+        print("Proxy refresh: every source is switched off, fetching nothing")
+        return []
+
+    results = await asyncio.gather(*(asyncio.to_thread(_source_fetcher(key)) for key, _meta in active))
+    merged: list[dict] = []
+    for (key, _meta), fetched in zip(active, results):
+        print(f"Proxy refresh: {key} returned {len(fetched)} proxies")
+        merged.extend(fetched)
+    return merged
 
 
 async def _insert_new_proxies(db: AsyncSession, proxy_data_list: list[dict]) -> tuple[int, int]:
@@ -421,10 +707,15 @@ async def _insert_new_proxies(db: AsyncSession, proxy_data_list: list[dict]) -> 
             db.add(Proxy(
                 host=proxy_data['host'],
                 port=proxy_data['port'],
+                # Only Webshare supplies these, and without them its proxies
+                # authenticate as nobody and fail every check.
+                username=proxy_data.get('username'),
+                password=proxy_data.get('password'),
                 protocol=proxy_data['protocol'],
                 type=proxy_data['type'],
                 country=proxy_data['country'],
                 provider=proxy_data['provider'],
+                is_rotating=bool(proxy_data.get('is_rotating')),
                 is_healthy=True,
                 last_checked=now,
             ))
@@ -453,7 +744,7 @@ async def replace_free_proxy_pool(db: AsyncSession) -> dict:
     up front would leave them looking at an empty table for the several
     seconds the scrape takes. If both sources come back empty the existing
     list is deliberately left alone rather than replaced with nothing."""
-    scraped = await fetch_all_free_proxies()
+    scraped = await fetch_all_free_proxies(db)
     if not scraped:
         return {
             'removed': 0, 'imported': 0, 'skipped': 0,
@@ -462,7 +753,15 @@ async def replace_free_proxy_pool(db: AsyncSession) -> dict:
 
     try:
         deleted = await db.execute(
-            sa_delete(Proxy).where(Proxy.assigned_bot_id.is_(None), Proxy.consumed_at.is_(None))
+            sa_delete(Proxy).where(
+                Proxy.assigned_bot_id.is_(None),
+                Proxy.consumed_at.is_(None),
+                # A rotating endpoint is a standing subscription, not a scraped
+                # address that goes stale - deleting and re-adding it every two
+                # minutes would churn the row (and could pull it out from under a
+                # run mid-flight) for no benefit.
+                Proxy.is_rotating.is_(False),
+            )
         )
         removed = deleted.rowcount or 0
         imported, skipped = await _insert_new_proxies(db, scraped)

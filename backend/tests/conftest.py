@@ -52,6 +52,27 @@ async def setup_db():
 
 
 @pytest.fixture(autouse=True)
+def no_real_webshare_credentials(monkeypatch):
+    """Blanks the Webshare settings for every test.
+
+    backend/.env holds real credentials on a developer machine, and
+    pydantic-settings reads them at import. Without this, what
+    fetch_proxies_from_webshare returns depends on whose machine the suite runs
+    on - three tests silently started failing the moment a rotating endpoint was
+    configured - and a test could reach Webshare's live API. Tests that exercise
+    a Webshare path patch in the specific values they need.
+    """
+    from app.services import proxy_service
+
+    for name in (
+        "WEBSHARE_API_KEY",
+        "WEBSHARE_PROXY_USERNAME",
+        "WEBSHARE_PROXY_PASSWORD",
+    ):
+        monkeypatch.setattr(proxy_service.settings, name, "")
+
+
+@pytest.fixture(autouse=True)
 def queued_pipelines(monkeypatch):
     """Records what would have been handed to the pipeline scheduler, instead of
     handing it over.

@@ -67,3 +67,39 @@ export const fetchProxiesFromFreeList = async () => {
   const { data } = await api.post('/api/proxies/fetch-from-free-list')
   return data
 }
+
+// --- Proxy providers ---------------------------------------------------------
+//
+// Each source of proxies, and whether identities are allowed to use it. Turning
+// one off deletes nothing: its proxies stay in the pool and keep showing on the
+// page, they just stop being offered to new identities and stop being
+// re-fetched by the refresher worker.
+
+export interface ProxyProvider {
+  key: string
+  display_name: string
+  kind: 'free' | 'paid' | 'manual'
+  is_enabled: boolean
+  // False for sources that can't be fetched (proxies added by hand).
+  can_fetch: boolean
+  // True for a paid source sitting at zero because no API key is configured -
+  // otherwise it just looks broken.
+  needs_api_key: boolean
+  total: number
+  retired: number
+  available: number
+  available_healthy: number
+}
+
+export const getProxyProviders = async () => {
+  const { data } = await api.get<ProxyProvider[]>('/api/proxies/providers')
+  return data
+}
+
+export const setProxyProviderEnabled = async (key: string, isEnabled: boolean) => {
+  const { data } = await api.patch<{ key: string; is_enabled: boolean }>(
+    `/api/proxies/providers/${encodeURIComponent(key)}`,
+    { is_enabled: isEnabled },
+  )
+  return data
+}

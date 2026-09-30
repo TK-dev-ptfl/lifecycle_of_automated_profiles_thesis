@@ -589,7 +589,8 @@ async def test_consumed_proxy_never_becomes_selectable_again_even_after_identity
             "host": "198.51.100.44", "port": 8080, "protocol": "http",
             "type": "residential", "country": "US", "provider": "free-proxy-list",
         }],
-    ), patch("app.services.proxy_service.fetch_proxies_from_proxyscrape", return_value=[]):
+    ), patch("app.services.proxy_service.fetch_proxies_from_proxyscrape", return_value=[]), \
+         patch("app.services.proxy_service.fetch_proxies_from_webshare", return_value=[]):
         async with AsyncSessionLocal() as db:
             result = await real_proxy_service.import_proxies_from_free_list(db)
     assert result["imported"] == 0

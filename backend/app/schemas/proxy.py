@@ -39,6 +39,10 @@ class ProxyResponse(ProxyBase):
     # candidate search. Exposed so the Proxies page can tell "free" from
     # "reserved" from "retired" rather than showing all three as "assigned".
     consumed_at: Optional[datetime] = None
+    # One endpoint, a different exit IP per connection - so it is never retired
+    # after a single use. The Proxies page badges these, since "used 0 times,
+    # still available" would otherwise look like a bug.
+    is_rotating: bool = False
     last_checked: datetime
     created_at: datetime
 

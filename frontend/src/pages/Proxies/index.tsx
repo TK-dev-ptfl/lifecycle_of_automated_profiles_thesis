@@ -1,6 +1,10 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { getProxies, getProxyStats, createProxy, deleteProxy, testProxy, cleanupUnhealthyProxies, fetchProxiesFromFreeList } from '../../api/proxies'
+import {
+  getProxies, getProxyStats, getProxyProviders, setProxyProviderEnabled,
+  createProxy, deleteProxy, testProxy, cleanupUnhealthyProxies, fetchProxiesFromFreeList,
+  type ProxyProvider,
+} from '../../api/proxies'
 import { Card } from '../../components/ui/Card'
 import { DataTable, Column } from '../../components/ui/DataTable'
 import { Badge } from '../../components/ui/Badge'
@@ -11,6 +15,112 @@ import { Select } from '../../components/ui/Select'
 import type { Proxy, ProxyProtocol, ProxyType } from '../../types'
 import { formatDistanceToNow } from 'date-fns'
 
+// Providers are tabs rather than one long table with a provider column: the
+// pool runs to thousands of rows across sources with wildly different quality,
+// and "which of these came from Webshare" is the question actually being asked.
+// ALL_TAB keeps an aggregate view available alongside them.
+const ALL_TAB = '__all__'
+
+function ProviderTabs({
+  providers, active, onSelect, totalAvailable, onToggle, toggling,
+}: {
+  providers: ProxyProvider[]
+  active: string
+  onSelect: (key: string) => void
+  totalAvailable: number
+  onToggle: (key: string, isEnabled: boolean) => void
+  toggling: boolean
+}) {
+  return (
+    <div className="flex flex-wrap items-stretch gap-1 border-b border-gray-700/60 px-2 pt-2">
+      {/* Aggregate view. No switch - there is nothing to turn on or off across
+          every source at once. */}
+      <button
+        onClick={() => onSelect(ALL_TAB)}
+        className={`-mb-px rounded-t-lg border-b-2 px-3 py-2 text-sm transition-colors ${
+          active === ALL_TAB
+            ? 'border-brand-500 text-gray-100'
+            : 'border-transparent text-gray-500 hover:text-gray-300'
+        }`}
+      >
+        All providers
+        <span className="ml-1.5 text-xs text-gray-600">{totalAvailable}</span>
+      </button>
+
+      {providers.map((provider) => {
+        const selected = active === provider.key
+        const off = !provider.is_enabled
+        return (
+          // The switch lives ON the tab, not in a panel below it: every
+          // provider's state is then visible and changeable at a glance, with no
+          // need to select a tab first. A div rather than a button because a
+          // checkbox inside a button is invalid HTML and the two clicks fight.
+          <div
+            key={provider.key}
+            className={`-mb-px flex items-center gap-2 rounded-t-lg border-b-2 pl-2 pr-3 transition-colors ${
+              selected ? 'border-brand-500 bg-gray-800/60' : 'border-transparent hover:bg-gray-800/30'
+            }`}
+          >
+            <input
+              type="checkbox"
+              checked={provider.is_enabled}
+              disabled={toggling}
+              onChange={(e) => onToggle(provider.key, e.target.checked)}
+              title={
+                provider.is_enabled
+                  ? 'Used for new identities - uncheck to stop offering its proxies'
+                  : 'Not used for new identities - check to start offering its proxies again'
+              }
+              aria-label={`Use ${provider.display_name} for new identities`}
+            />
+            <button
+              onClick={() => onSelect(provider.key)}
+              className={`py-2 text-sm transition-colors ${
+                selected ? 'text-gray-100' : 'text-gray-500 hover:text-gray-300'
+              } ${off ? 'line-through decoration-gray-600' : ''}`}
+              title={off ? 'Switched off - not used for new identities' : 'Show only this provider'}
+            >
+              {provider.display_name}
+              <span className={`ml-1.5 text-xs ${selected ? 'text-gray-400' : 'text-gray-600'}`}>
+                {provider.available}
+              </span>
+            </button>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// Detail for whichever provider's tab is open. The on/off switch itself is on
+// the tab (see ProviderTabs) - this explains what that switch does, since the
+// surprising part is that nothing is deleted.
+function ProviderPanel({ provider }: { provider: ProxyProvider }) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-gray-700/40 px-4 py-3 text-xs text-gray-500">
+      <Badge variant={provider.kind === 'paid' ? 'success' : 'gray'} label={provider.kind} />
+      <span><span className="text-gray-200">{provider.available_healthy}</span> usable</span>
+      <span>{provider.available} in pool</span>
+      <span>{provider.retired} used</span>
+      {!provider.can_fetch && provider.kind !== 'manual' && <span>not fetchable</span>}
+
+      {provider.needs_api_key && (
+        <p className="w-full text-[11px] text-amber-400">
+          No credentials configured — set WEBSHARE_API_KEY (proxy list) or
+          WEBSHARE_PROXY_USERNAME / WEBSHARE_PROXY_PASSWORD (rotating endpoint) in backend/.env
+        </p>
+      )}
+      {!provider.is_enabled && (
+        <p className="w-full text-[11px] text-gray-500">
+          Switched off: its proxies stay in the pool and the list below still shows them, they just
+          aren't offered to new identities and aren't re-fetched. Turning it back on makes them
+          eligible again straight away.
+        </p>
+      )}
+    </div>
+  )
+}
+
 export default function ProxiesPage() {
   const qc = useQueryClient()
   const [showCreate, setShowCreate] = useState(false)
@@ -20,14 +130,23 @@ export default function ProxiesPage() {
   // re-import the same address - they're never selectable again, and there are
   // thousands of them, so showing them by default buries the live pool.
   const [showRetired, setShowRetired] = useState(false)
+  // Which provider tab is open. ALL_TAB shows every source at once.
+  const [activeTab, setActiveTab] = useState<string>(ALL_TAB)
   const [newProxy, setNewProxy] = useState<Partial<Proxy>>({ host: '', port: 8080, protocol: 'http', type: 'datacenter', country: 'US', provider: 'custom' })
 
   const { data: proxies = [], isLoading } = useQuery({
-    queryKey: ['proxies', healthFilter, showRetired],
+    queryKey: ['proxies', healthFilter, showRetired, activeTab],
     queryFn: () => getProxies({
       ...(healthFilter !== '' ? { is_healthy: healthFilter } : {}),
       ...(showRetired ? {} : { retired: 'false' }),
+      ...(activeTab !== ALL_TAB ? { provider: activeTab } : {}),
     }),
+    refetchInterval: 15000,
+  })
+
+  const { data: providers = [], error: providersError } = useQuery({
+    queryKey: ['proxies', 'providers'],
+    queryFn: getProxyProviders,
     refetchInterval: 15000,
   })
 
@@ -55,6 +174,11 @@ export default function ProxiesPage() {
   const testAll = useMutation({ mutationFn: testAllSequentially, onSuccess: inv })
   const cleanup = useMutation({ mutationFn: cleanupUnhealthyProxies, onSuccess: inv })
   const create = useMutation({ mutationFn: createProxy, onSuccess: () => { inv(); setShowCreate(false) } })
+  const toggleProvider = useMutation({
+    mutationFn: ({ key, isEnabled }: { key: string; isEnabled: boolean }) =>
+      setProxyProviderEnabled(key, isEnabled),
+    onSuccess: inv,
+  })
   const fetchFree = useMutation({ 
     mutationFn: fetchProxiesFromFreeList, 
     onSuccess: () => { 
@@ -66,12 +190,29 @@ export default function ProxiesPage() {
     }
   })
 
+  const providerByKey = new Map(providers.map((provider) => [provider.key, provider]))
+  const activeProvider = activeTab === ALL_TAB ? null : providerByKey.get(activeTab) ?? null
+
   const columns: Column<Proxy>[] = [
     { key: 'host', header: 'Address', render: (p) => <span className="font-mono text-sm text-gray-200">{p.host}:{p.port}</span> },
     { key: 'type', header: 'Type', render: (p) => <Badge variant="info" label={p.type} /> },
     { key: 'protocol', header: 'Protocol', render: (p) => <Badge variant="gray" label={p.protocol} /> },
     { key: 'country', header: 'Country', render: (p) => <span className="text-gray-400">{p.country}</span> },
-    { key: 'provider', header: 'Provider', render: (p) => <span className="text-gray-400">{p.provider}</span> },
+    {
+      key: 'provider', header: 'Provider',
+      render: (p) => {
+        const known = providerByKey.get(p.provider)
+        return (
+          <button
+            onClick={() => setActiveTab(p.provider)}
+            className={`text-left hover:underline ${known && !known.is_enabled ? 'text-gray-600 line-through' : 'text-gray-400'}`}
+            title={known && !known.is_enabled ? 'This provider is switched off - not used for new identities' : 'Open this provider'}
+          >
+            {p.provider}
+          </button>
+        )
+      },
+    },
     {
       key: 'health', header: 'Health',
       render: (p) => (
@@ -84,7 +225,9 @@ export default function ProxiesPage() {
     {
       key: 'assigned', header: 'State',
       render: (p) => (
-        p.consumed_at
+        p.is_rotating
+          ? <span className="text-sky-400 text-xs" title="Rotating endpoint: one hostname, a different exit IP per connection - reusable across identities without any of them sharing an address">rotating</span>
+          : p.consumed_at
           ? <span className="text-red-400 text-xs" title="An account was registered through this IP - retired permanently, never offered again">retired</span>
           : p.assigned_bot_id
             ? <span className="text-amber-300 text-xs" title="Reserved for an identity whose pipeline hasn't run yet">reserved</span>
@@ -129,9 +272,28 @@ export default function ProxiesPage() {
         </div>
       </div>
 
-      <Card noPad title="Proxies"
-        action={
-          <div className="flex gap-2">
+      <Card noPad title="Proxies">
+        <ProviderTabs
+          providers={providers}
+          active={activeTab}
+          onSelect={setActiveTab}
+          totalAvailable={stats?.available ?? 0}
+          onToggle={(key, isEnabled) => toggleProvider.mutate({ key, isEnabled })}
+          toggling={toggleProvider.isPending}
+        />
+        {/* An empty provider list used to look identical to a backend that
+            doesn't serve /api/proxies/providers yet - which is exactly what a
+            stale running server looks like. Say which it is. */}
+        {providersError && (
+          <p className="border-b border-amber-700/40 bg-amber-900/10 px-4 py-2.5 text-xs text-amber-300">
+            Couldn't load providers: {providersError instanceof Error ? providersError.message : 'request failed'}.
+            If the backend is running an older build, restart it — the per-provider switches need
+            GET /api/proxies/providers.
+          </p>
+        )}
+        {activeProvider && <ProviderPanel provider={activeProvider} />}
+        <div className="flex flex-wrap items-center justify-end gap-2 px-4 py-3">
+
             <select
               value={healthFilter}
               onChange={(e) => setHealthFilter(e.target.value)}
@@ -149,9 +311,7 @@ export default function ProxiesPage() {
             <Button variant="danger" loading={cleanup.isPending} onClick={() => cleanup.mutate()}>Cleanup</Button>
             <Button variant="primary" loading={fetchFree.isPending} onClick={() => fetchFree.mutate()}>Get Proxies</Button>
             <Button onClick={() => setShowCreate(true)}>+ Add Proxy</Button>
-          </div>
-        }
-      >
+        </div>
         <DataTable columns={columns} data={proxies} keyExtractor={(p) => p.id} loading={isLoading} emptyMessage="No proxies — add one to get started" />
       </Card>
 

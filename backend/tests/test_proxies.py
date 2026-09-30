@@ -1,4 +1,5 @@
-from unittest.mock import MagicMock, patch
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -190,7 +191,8 @@ async def test_import_proxies_from_free_list_merges_both_sources(db_session):
     ]
 
     with patch("app.services.proxy_service.fetch_proxies_from_free_proxy_list", return_value=free_proxy_list_data), \
-         patch("app.services.proxy_service.fetch_proxies_from_proxyscrape", return_value=proxyscrape_data):
+         patch("app.services.proxy_service.fetch_proxies_from_proxyscrape", return_value=proxyscrape_data), \
+         patch("app.services.proxy_service.fetch_proxies_from_webshare", return_value=[]):
         result = await proxy_service.import_proxies_from_free_list(db_session)
 
     assert result["imported"] == 2
@@ -200,3 +202,368 @@ async def test_import_proxies_from_free_list_merges_both_sources(db_session):
     hosts = {p.host for p in all_proxies}
     assert "203.0.113.10" in hosts
     assert "203.0.113.20" in hosts
+
+
+# --- Per-provider on/off ------------------------------------------------------
+
+async def _all_providers_on(db):
+    """Provider toggles are committed, so they outlive the db_session fixture's
+    rollback and leak into whatever test runs next. Each provider test therefore
+    states the starting point it needs instead of inheriting one."""
+    await proxy_service.seed_proxy_providers(db)
+    for provider in await proxy_service.get_proxy_providers(db):
+        if not provider["is_enabled"]:
+            await proxy_service.set_proxy_provider_enabled(db, provider["key"], True)
+
+
+@pytest.mark.asyncio
+async def test_seed_proxy_providers_is_idempotent_and_keeps_user_choices(db_session):
+    """Seeding runs on every boot. It must create missing rows and leave
+    is_enabled alone on rows that exist - a restart silently re-enabling a
+    source someone turned off would be the worst kind of surprise."""
+    await _all_providers_on(db_session)
+    keys = {p["key"] for p in await proxy_service.get_proxy_providers(db_session)}
+    assert {"free-proxy-list", "proxyscrape", "webshare"} <= keys
+
+    await proxy_service.set_proxy_provider_enabled(db_session, "proxyscrape", False)
+    await proxy_service.seed_proxy_providers(db_session)
+
+    by_key = {p["key"]: p for p in await proxy_service.get_proxy_providers(db_session)}
+    assert by_key["proxyscrape"]["is_enabled"] is False
+    assert by_key["free-proxy-list"]["is_enabled"] is True
+
+    await _all_providers_on(db_session)
+
+
+@pytest.mark.asyncio
+async def test_disabled_provider_is_excluded_from_identity_candidates(db_session):
+    """The whole point of the switch: a disabled provider's proxies stay in the
+    pool but stop being offered to new identities."""
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+    from app.services import identity_service
+
+    await _all_providers_on(db_session)
+    kept = Proxy(
+        host="198.51.100.201", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+        country="US", provider="free-proxy-list",
+    )
+    excluded = Proxy(
+        host="198.51.100.202", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+        country="US", provider="proxyscrape",
+    )
+    db_session.add_all([kept, excluded])
+    await db_session.commit()
+
+    both = {c.id for c in await identity_service.list_free_proxy_candidates(db_session)}
+    assert kept.id in both and excluded.id in both
+
+    await proxy_service.set_proxy_provider_enabled(db_session, "proxyscrape", False)
+    after = {c.id for c in await identity_service.list_free_proxy_candidates(db_session)}
+    assert kept.id in after
+    assert excluded.id not in after
+
+    # Not deleted, and not hidden from the page - only from selection.
+    assert excluded.id in {p.id for p in await proxy_service.get_proxies(db_session)}
+
+    # Turning it back on makes them eligible again with no re-fetch.
+    await proxy_service.set_proxy_provider_enabled(db_session, "proxyscrape", True)
+    assert excluded.id in {c.id for c in await identity_service.list_free_proxy_candidates(db_session)}
+
+
+@pytest.mark.asyncio
+async def test_a_provider_with_no_row_is_treated_as_enabled(db_session):
+    """disabled_provider_keys returns what to EXCLUDE, so a provider nobody has
+    ever recorded - a one-off name typed into the Add Proxy form - stays usable
+    instead of silently vanishing from selection."""
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+    from app.services import identity_service
+
+    ad_hoc = Proxy(
+        host="198.51.100.210", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+        country="US", provider="some-provider-nobody-registered",
+    )
+    db_session.add(ad_hoc)
+    await db_session.commit()
+
+    assert ad_hoc.id in {c.id for c in await identity_service.list_free_proxy_candidates(db_session)}
+
+
+@pytest.mark.asyncio
+async def test_disabled_provider_is_not_fetched_on_refresh(db_session):
+    """A source switched off must also stop refilling the pool every two
+    minutes, or the toggle would only be half a switch."""
+    await _all_providers_on(db_session)
+    for key in ("proxyscrape", "webshare"):
+        await proxy_service.set_proxy_provider_enabled(db_session, key, False)
+
+    free_list = MagicMock(return_value=[])
+    scrape = MagicMock(return_value=[])
+    webshare = MagicMock(return_value=[])
+    with patch("app.services.proxy_service.fetch_proxies_from_free_proxy_list", free_list), \
+         patch("app.services.proxy_service.fetch_proxies_from_proxyscrape", scrape), \
+         patch("app.services.proxy_service.fetch_proxies_from_webshare", webshare):
+        await proxy_service.fetch_all_free_proxies(db_session)
+
+    free_list.assert_called_once()
+    scrape.assert_not_called()
+    webshare.assert_not_called()
+
+    await _all_providers_on(db_session)
+
+
+@pytest.mark.asyncio
+async def test_provider_counts_are_reported_per_provider(db_session):
+    """What the Proxies page groups by - each source's own share of the pool,
+    counted in the database rather than by fetching every row."""
+    from datetime import datetime, timezone
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+
+    await _all_providers_on(db_session)
+    db_session.add_all([
+        Proxy(host="198.51.100.221", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+              country="US", provider="webshare"),
+        Proxy(host="198.51.100.222", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+              country="US", provider="webshare", is_healthy=False),
+        Proxy(host="198.51.100.223", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+              country="US", provider="webshare", consumed_at=datetime.now(timezone.utc)),
+    ])
+    await db_session.commit()
+
+    webshare = next(p for p in await proxy_service.get_proxy_providers(db_session) if p["key"] == "webshare")
+    assert webshare["total"] == 3
+    assert webshare["retired"] == 1
+    assert webshare["available"] == 2
+    assert webshare["available_healthy"] == 1
+    assert webshare["kind"] == "paid"
+    assert webshare["can_fetch"] is True
+
+
+@pytest.mark.asyncio
+async def test_toggling_an_unknown_provider_is_a_404(client, auth_headers):
+    resp = await client.patch(
+        "/api/proxies/providers/not-a-real-provider",
+        json={"is_enabled": False},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 404
+
+
+def test_webshare_fetcher_skips_itself_without_an_api_key():
+    """No key is a normal, expected state - it must contribute nothing and say
+    why, not fail the whole refresh the other sources are part of."""
+    with patch("app.services.proxy_service.settings.WEBSHARE_API_KEY", ""):
+        assert proxy_service.fetch_proxies_from_webshare() == []
+
+
+def test_webshare_fetcher_parses_credentials_and_skips_invalid_entries():
+    """Webshare is the only source that returns per-proxy credentials, and
+    without them its proxies authenticate as nobody and fail every check. It
+    also marks proxies it knows to be down - no reason to import one just to
+    health-check it and throw it away."""
+    page = {
+        "next": None,
+        "results": [
+            {
+                "proxy_address": "45.1.2.3", "port": 5555, "username": "u1", "password": "p1",
+                "country_code": "de", "valid": True,
+            },
+            {"proxy_address": "45.1.2.4", "port": 5555, "username": "u2", "password": "p2", "valid": False},
+            {"proxy_address": None, "port": 5555, "valid": True},
+            {"proxy_address": "45.1.2.5", "port": "not-an-int", "valid": True},
+        ],
+    }
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json = MagicMock(return_value=page)
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value.get.return_value = fake_response
+
+    with patch("app.services.proxy_service.settings.WEBSHARE_API_KEY", "test-key"), \
+         patch("app.services.proxy_service.httpx.Client", return_value=fake_client):
+        result = proxy_service.fetch_proxies_from_webshare()
+
+    assert result == [{
+        "host": "45.1.2.3", "port": 5555, "username": "u1", "password": "p1",
+        "protocol": "http", "type": "residential", "country": "DE", "provider": "webshare",
+    }]
+
+
+def test_webshare_fetcher_returns_empty_on_request_failure():
+    with patch("app.services.proxy_service.settings.WEBSHARE_API_KEY", "test-key"), \
+         patch("app.services.proxy_service.httpx.Client", side_effect=Exception("401 unauthorized")):
+        assert proxy_service.fetch_proxies_from_webshare() == []
+
+
+@pytest.mark.asyncio
+async def test_imported_proxies_keep_their_credentials(db_session):
+    """Webshare's username/password have to survive the import, or its proxies
+    are imported as unauthenticated and fail every health check."""
+    from sqlalchemy import select
+    from app.models.proxy import Proxy
+
+    scraped = [{
+        "host": "45.9.9.9", "port": 5555, "username": "wsuser", "password": "wspass",
+        "protocol": "http", "type": "residential", "country": "DE", "provider": "webshare",
+    }]
+    with patch("app.services.proxy_service.fetch_all_free_proxies", return_value=scraped):
+        result = await proxy_service.import_proxies_from_free_list(db_session)
+    assert result.get("error") is None
+
+    row = (await db_session.execute(select(Proxy).where(Proxy.host == "45.9.9.9"))).scalar_one()
+    assert row.username == "wsuser"
+    assert row.password == "wspass"
+
+
+# --- Rotating endpoint --------------------------------------------------------
+
+def test_rotating_endpoint_is_none_without_proxy_credentials():
+    with patch("app.services.proxy_service.settings.WEBSHARE_PROXY_USERNAME", ""), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_PASSWORD", ""):
+        assert proxy_service.webshare_rotating_endpoint() is None
+
+
+def test_rotating_endpoint_is_flagged_and_carries_its_credentials():
+    """is_rotating is what stops the pipeline retiring this after one signup, and
+    the credentials are what make it authenticate at all."""
+    with patch("app.services.proxy_service.settings.WEBSHARE_PROXY_HOST", "p.webshare.io"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_PORT", 80), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_USERNAME", "u"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_PASSWORD", "p"):
+        entry = proxy_service.webshare_rotating_endpoint()
+
+    assert entry == {
+        "host": "p.webshare.io", "port": 80, "username": "u", "password": "p",
+        "protocol": "http", "type": "residential", "country": "UN",
+        "provider": "webshare", "is_rotating": True,
+    }
+
+
+def test_webshare_returns_the_rotating_endpoint_without_an_api_key():
+    """The two Webshare modes are independent - proxy credentials alone are
+    enough, no API key needed."""
+    with patch("app.services.proxy_service.settings.WEBSHARE_API_KEY", ""), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_USERNAME", "u"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_PASSWORD", "p"):
+        rows = proxy_service.fetch_proxies_from_webshare()
+
+    assert len(rows) == 1
+    assert rows[0]["is_rotating"] is True
+
+
+def test_a_failing_api_key_still_leaves_the_rotating_endpoint():
+    """An expired API key must not take the rest of Webshare down with it."""
+    with patch("app.services.proxy_service.settings.WEBSHARE_API_KEY", "expired"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_USERNAME", "u"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_PASSWORD", "p"), \
+         patch("app.services.proxy_service.httpx.Client", side_effect=Exception("401")):
+        rows = proxy_service.fetch_proxies_from_webshare()
+
+    assert len(rows) == 1 and rows[0]["is_rotating"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_rotating_endpoint_serves_many_identities_without_being_retired(db_session):
+    """The one exception to "one proxy, one identity, then retired". Every
+    connection through a rotating endpoint exits from a different IP, so reusing
+    the row does not reuse an address - and retiring it after the first signup
+    would make the whole subscription useless."""
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+    from app.services import identity_service
+
+    rotating = Proxy(
+        host="p.webshare.io", port=80, username="u", password="p",
+        protocol=ProxyProtocol.http, type=ProxyType.residential,
+        country="UN", provider="webshare", is_rotating=True,
+    )
+    db_session.add(rotating)
+    await db_session.commit()
+
+    first, second, third = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    # Three different identities all succeed in claiming it...
+    for identity_id in (first, second, third):
+        assert await identity_service._claim_and_consume_free_proxy(db_session, rotating.id, identity_id) is True
+
+    await db_session.refresh(rotating)
+    # ...and it is neither locked to any of them nor retired.
+    assert rotating.assigned_bot_id is None
+    assert rotating.consumed_at is None
+
+    # Reserving is the same story.
+    assert await identity_service._reserve_free_proxy_for(db_session, rotating.id, first) is True
+    await db_session.refresh(rotating)
+    assert rotating.assigned_bot_id is None
+
+    # And it is still offered as a candidate afterwards.
+    assert rotating.id in {c.id for c in await identity_service.list_free_proxy_candidates(db_session)}
+
+
+@pytest.mark.asyncio
+async def test_a_fixed_proxy_is_still_exclusive(db_session):
+    """The rotating exemption must not leak into ordinary proxies - two
+    identities sharing a fixed IP is exactly what the whole scheme prevents."""
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+    from app.services import identity_service
+
+    fixed = Proxy(
+        host="203.0.113.240", port=8080, protocol=ProxyProtocol.http,
+        type=ProxyType.residential, country="US", provider="webshare", is_rotating=False,
+    )
+    db_session.add(fixed)
+    await db_session.commit()
+
+    assert await identity_service._claim_and_consume_free_proxy(db_session, fixed.id, uuid.uuid4()) is True
+    assert await identity_service._claim_and_consume_free_proxy(db_session, fixed.id, uuid.uuid4()) is False
+
+    await db_session.refresh(fixed)
+    assert fixed.consumed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_pool_refresh_leaves_the_rotating_endpoint_alone(db_session):
+    """A rotating endpoint is a standing subscription, not a scraped address that
+    goes stale - churning the row every two minutes could pull it out from under
+    a run mid-flight."""
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+
+    rotating = Proxy(
+        host="p.webshare.io", port=80, username="u", password="p",
+        protocol=ProxyProtocol.http, type=ProxyType.residential,
+        country="UN", provider="webshare", is_rotating=True,
+    )
+    scraped = Proxy(
+        host="203.0.113.241", port=8080, protocol=ProxyProtocol.http,
+        type=ProxyType.datacenter, country="UN", provider="proxyscrape",
+    )
+    db_session.add_all([rotating, scraped])
+    await db_session.commit()
+    rotating_id, scraped_id = rotating.id, scraped.id
+
+    with patch("app.services.proxy_service.fetch_all_free_proxies", return_value=[
+        {"host": "203.0.113.242", "port": 8080, "protocol": "http",
+         "type": "datacenter", "country": "UN", "provider": "proxyscrape"},
+    ]):
+        result = await proxy_service.replace_free_proxy_pool(db_session)
+
+    assert result.get("error") is None
+    assert await db_session.get(Proxy, rotating_id) is not None, "the rotating endpoint must survive a refresh"
+    assert await db_session.get(Proxy, scraped_id) is None, "an ordinary stale row should still be replaced"
+
+
+@pytest.mark.asyncio
+async def test_import_preserves_the_rotating_flag(db_session):
+    from sqlalchemy import select
+    from app.models.proxy import Proxy
+
+    entry = {
+        "host": "p.webshare.io", "port": 80, "username": "u", "password": "p",
+        "protocol": "http", "type": "residential", "country": "UN",
+        "provider": "webshare", "is_rotating": True,
+    }
+    with patch("app.services.proxy_service.fetch_all_free_proxies", return_value=[entry]):
+        await proxy_service.import_proxies_from_free_list(db_session)
+
+    row = (await db_session.execute(
+        select(Proxy).where(Proxy.host == "p.webshare.io")
+    )).scalars().first()
+    assert row is not None and row.is_rotating is True

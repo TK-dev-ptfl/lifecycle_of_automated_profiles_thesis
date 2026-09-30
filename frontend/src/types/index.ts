@@ -70,6 +70,11 @@ export interface Proxy {
   // identity, and the row survives only so a later scrape can't re-import the
   // same address. assigned_bot_id without this means merely reserved.
   consumed_at?: string | null
+  // A rotating ("backbone") endpoint: one host:port that hands out a different
+  // exit IP per connection. The one proxy that is reusable across identities -
+  // consecutive identities get different addresses even though they dial the
+  // same hostname - so it is never locked or retired.
+  is_rotating?: boolean
   last_checked: string
   created_at: string
 }

@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.database import engine, Base
+from app.database import AsyncSessionLocal, engine, Base
 import app.models  # noqa: F401 – register all ORM models
 from app.auth.router import router as auth_router
 from app.routers.bots import router as bots_router
@@ -17,6 +17,8 @@ from app.routers.email_platforms import router as email_platforms_router
 from app.routers.emails import router as emails_router
 from app.routers.sandboxes import router as sandboxes_router
 from app.routers.workers import router as workers_router
+from app.services import proxy_service
+from app.utilities.runtime import browser_launch_blocked_reason
 from app.services.identity_service import PROXY_TEST_BATCH_SIZE
 from app.workers.pipeline_scheduler import DEFAULT_CONCURRENCY, pipeline_scheduler
 from app.workers.proxy_refresher import proxy_refresher
@@ -37,6 +39,10 @@ async def _ensure_sqlite_compat_columns() -> None:
         proxy_columns = {row[1] for row in proxy_rows.fetchall()}
         if "consumed_at" not in proxy_columns:
             await conn.exec_driver_sql("ALTER TABLE proxies ADD COLUMN consumed_at DATETIME")
+        if "is_rotating" not in proxy_columns:
+            await conn.exec_driver_sql(
+                "ALTER TABLE proxies ADD COLUMN is_rotating BOOLEAN NOT NULL DEFAULT 0"
+            )
 
         # identities.email / email_provider used to be NOT NULL; identities can
         # now exist before their mailbox does, so relax that constraint on
@@ -77,6 +83,13 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await _ensure_sqlite_compat_columns()
+    # Provider rows back the Proxies page's per-source on/off switches. Seeded
+    # here rather than by a migration so a new source added in code shows up on
+    # the next boot; existing rows keep their is_enabled, since that's the
+    # user's setting and a restart must not silently re-enable a source they
+    # turned off.
+    async with AsyncSessionLocal() as db:
+        await proxy_service.seed_proxy_providers(db)
 
     # Proxy health checks are blocking socket work dispatched through
     # asyncio.to_thread, and this workload submits a great many of them at
@@ -101,6 +114,16 @@ async def lifespan(app: FastAPI):
     # anyone is creating accounts right now. The scheduler does NOT - each of
     # its slots drives a real Chromium instance and registers a real mailbox,
     # so it waits for an explicit POST /api/workers/pipeline-scheduler/start.
+
+    # Loud, once, at boot: every signup pipeline will fail without this, and the
+    # exception it fails with explains nothing.
+    blocked = browser_launch_blocked_reason()
+    if blocked is not None:
+        print(
+            "\n*** WARNING: email signup pipelines cannot run - "
+            f"{blocked}\n"
+        )
+
     proxy_refresher.start()
     try:
         yield

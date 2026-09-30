@@ -45,5 +45,16 @@ class Proxy(Base):
     # actually stops a later scrape from re-importing (and a later pipeline
     # from re-using) the exact same IP once it's been used once.
     consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # A rotating ("backbone") endpoint: one host:port that hands out a DIFFERENT
+    # exit IP on every connection, rather than being one fixed IP.
+    #
+    # This is the one exception to "a proxy is used by exactly one identity and
+    # then retired". That rule exists so two accounts never share an IP - and a
+    # rotating endpoint honours it by construction, since consecutive identities
+    # get different exit IPs even though they dial the same hostname. Treating it
+    # like a fixed proxy would retire it after the very first signup and make the
+    # whole subscription useless, so it is deliberately never locked to an
+    # identity and never consumed (see identity_service._claim_and_consume_free_proxy).
+    is_rotating: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     bot: Mapped[Optional[Bot]] = relationship("Bot", back_populates="proxy", foreign_keys=[assigned_bot_id])
