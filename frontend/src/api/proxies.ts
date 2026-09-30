@@ -6,8 +6,24 @@ export const getProxy = async (id: string) => {
   return data
 }
 
+// Pass retired: 'false' to hide proxies permanently out of circulation - ones a
+// pipeline has used, or that were retired after failing in real use. Their rows
+// are kept forever so a later scrape can't re-import the same address, so they
+// accumulate into the thousands and swamp the list otherwise.
 export const getProxies = async (params?: Record<string, string>) => {
   const { data } = await api.get<Proxy[]>('/api/proxies', { params })
+  return data
+}
+
+export interface ProxyStats {
+  total: number
+  retired: number
+  available: number
+  available_healthy: number
+}
+
+export const getProxyStats = async () => {
+  const { data } = await api.get<ProxyStats>('/api/proxies/stats')
   return data
 }
 

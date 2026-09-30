@@ -34,7 +34,6 @@ from __future__ import annotations
 import asyncio
 import random
 import re
-import secrets
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date
@@ -73,12 +72,68 @@ def _typing_delay() -> float:
     return random.uniform(*TYPE_DELAY_RANGE_MS)
 
 
-def generate_username(prefix: str = "bot") -> str:
-    """Fallback used only when there's no identity name to base a username
-    on (e.g. running this file standalone). An obviously-automated
-    "bot3c4e660b"-style address is otherwise exactly the kind of signal
-    thesis 2.2.3 flags - real accounts don't look like that."""
-    return f"{prefix}{secrets.token_hex(4)}"
+# Tuta rejects an address that's already taken, and short name-shaped local
+# parts ("alexsmith", "jordan42") are overwhelmingly taken already on a mail
+# host this old - that rejection was the single most common way
+# step_fill_credentials burned all MAX_USERNAME_ATTEMPTS. Every generated
+# address is therefore padded out to at least this many characters, which buys
+# both length and the entropy that comes with it.
+USERNAME_MIN_LENGTH = 18
+# Kept well inside any sane local-part limit (RFC 5321 allows 64) while leaving
+# the address readable. The numeric tail is never what gets trimmed to fit -
+# see the budget calculation in _finish_username - since that's where most of
+# the entropy is.
+USERNAME_MAX_LENGTH = 30
+
+# Words real people actually bolt onto a handle when their plain name is taken.
+# This is what makes a long address still read as a person's rather than as a
+# generated token: "alexsmith.photography24" passes where "alexsmith" is taken
+# and "alex3c4e660b" looks like exactly what it is.
+HANDLE_WORDS = [
+    "photography", "travels", "music", "fitness", "outdoors", "reading", "cooking",
+    "cycling", "running", "climbing", "gaming", "design", "writes", "sketches",
+    "gardening", "coffee", "baking", "hiking", "camping", "surfing", "skating",
+    "official", "daily", "world", "online", "here", "real", "studio", "works",
+    "journal", "notes", "diary", "life", "space", "corner", "place",
+]
+
+
+def _handle_word() -> str:
+    return random.choice(HANDLE_WORDS)
+
+
+def generate_username(prefix: str = "") -> str:
+    """Fallback used only when there's no identity name to base a username on
+    (e.g. running this file standalone).
+
+    Deliberately word-based rather than the old "bot" + hex: an obviously
+    automated bot3c4e660b-style address is exactly the kind of signal thesis
+    2.2.3 flags, and it was short enough to collide besides. Two handle words
+    plus a number land in the same length band as the identity-derived ones."""
+    core = f"{prefix}{_handle_word()}{random.choice(['', '.', '_'])}{_handle_word()}"
+    return _finish_username(core, str(random.randint(1000, 999999)))
+
+
+def _finish_username(body: str, tail: str) -> str:
+    """Assembles the final local part: pads `body` with extra handle words until
+    the whole thing clears USERNAME_MIN_LENGTH, then trims only `body` if the
+    result would exceed USERNAME_MAX_LENGTH.
+
+    `tail` (the numeric part) is never trimmed. It carries most of the entropy,
+    so cutting it to fit the length cap would defeat the point of the cap being
+    there - which is to keep addresses long enough not to collide."""
+    while len(body) + len(tail) < USERNAME_MIN_LENGTH:
+        body = f"{body}{random.choice(['', '.', '_'])}{_handle_word()}"
+
+    body = body[:USERNAME_MAX_LENGTH - len(tail)].strip("._")
+    username = re.sub(r"[^a-z0-9._]", "", f"{body}{tail}".lower()).strip("._")
+
+    # Belt-and-suspenders: sanitising can only ever shorten, so a body that was
+    # all symbols could in principle land under the minimum. Top it up with
+    # digits rather than returning something short enough to collide.
+    if len(username) < USERNAME_MIN_LENGTH:
+        username += "".join(str(random.randint(0, 9)) for _ in range(USERNAME_MIN_LENGTH - len(username)))
+    return username[:USERNAME_MAX_LENGTH]
 
 
 def _name_parts(display_name: str) -> list[str]:
@@ -88,11 +143,17 @@ def _name_parts(display_name: str) -> list[str]:
 
 def generate_username_from_identity(display_name: str, age: Optional[int] = None) -> str:
     """Real people don't all pick 'name + 3 random digits' - some use their
-    birth year, some just initials, some no number at all. Picks one of
-    several realistic patterns each time instead of always the same shape,
-    so a whole fleet of these doesn't look like a template was run through a
-    counter. Falls back to generate_username() if the name yields nothing
-    usable (empty/symbols-only)."""
+    birth year, some a hobby, some both. Picks one of several realistic shapes
+    each time instead of always the same one, so a whole fleet of these doesn't
+    look like a template was run through a counter. Falls back to
+    generate_username() if the name yields nothing usable (empty/symbols-only).
+
+    Every result clears USERNAME_MIN_LENGTH: a bare "alexsmith" has long since
+    been taken on tuta.com, and being rejected as unavailable was the main
+    reason step_fill_credentials used to run through all its attempts. The extra
+    length comes from real handle words and a numeric tail rather than random
+    hex, so the addresses stay human-looking while being long enough not to
+    collide."""
     parts = _name_parts(display_name)
     if not parts:
         return generate_username()
@@ -119,21 +180,32 @@ def generate_username_from_identity(display_name: str, age: Optional[int] = None
     else:
         core = first
 
-    # Numeric suffix: a birth year (full or 2-digit) derived from the
-    # identity's actual age when we have one, a small random number, or
-    # nothing at all - varying which, instead of a uniform 3-digit code
-    # every time, is what actually reads as human.
-    suffix = ""
-    roll = random.random()
-    if age is not None and roll < 0.45:
-        birth_year = date.today().year - age - random.randint(0, 1)
-        suffix = str(birth_year) if random.random() < 0.5 else f"{birth_year % 100:02d}"
-    elif roll < 0.75:
-        suffix = str(random.randint(1, 999))
-    # else: no numeric suffix at all
+    # A hobby/descriptor word most of the time - this is the part that makes a
+    # name-based address long enough to still be free without looking generated.
+    if random.random() < 0.8:
+        core = f"{core}{random.choice(['', '.', '_'])}{_handle_word()}"
 
-    username = re.sub(r"[^a-z0-9._]", "", f"{core}{suffix}".lower()).strip("._")
-    return username[:20] or generate_username()
+    # Numeric tail: a birthday derived from the identity's actual age when we
+    # have one, otherwise a plain number. Always present now - the old "no
+    # number at all" branch produced exactly the short, plain, already-taken
+    # addresses this is meant to avoid.
+    if age is not None and random.random() < 0.5:
+        birth_year = date.today().year - age - random.randint(0, 1)
+        year = str(birth_year) if random.random() < 0.6 else f"{birth_year % 100:02d}"
+        # Year followed by a month+day is one of the most common real shapes
+        # ("alexsmith19980412"), and it's also where most of the entropy lives:
+        # a bare 2-digit year leaves only a handful of possible addresses per
+        # name, which is how two identities with the same name and age would
+        # collide with each other - never mind with a stranger's existing
+        # account.
+        if random.random() < 0.85:
+            tail = f"{year}{random.randint(1, 12):02d}{random.randint(1, 28):02d}"
+        else:
+            tail = year
+    else:
+        tail = str(random.randint(1000, 999999))
+
+    return _finish_username(core, tail)
 
 
 # A 20-char fully-random string is exactly the kind of high-entropy,
@@ -644,18 +716,20 @@ async def run_tuta_signup_pipeline(
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless, proxy=proxy)
-        # ignore_https_errors: many proxies in this pool (free/public
-        # sources) don't properly tunnel HTTPS - they terminate the TLS
-        # connection themselves and hand back their own certificate instead
-        # of relaying tuta.com's real one, which Chromium otherwise rejects
-        # outright with ERR_CERT_AUTHORITY_INVALID before the page ever
-        # loads (not a timeout - no amount of waiting fixes it). Accepted
-        # tradeoff: a proxy doing this can also read/modify the "encrypted"
-        # traffic it's terminating, so this only makes sense because the
-        # credentials in play are throwaway ones generated for this signup,
-        # not anything sensitive reused elsewhere.
+        # ignore_https_errors is deliberately NOT set (Playwright's secure
+        # default - certificate validation stays on). Some proxies in this
+        # pool (free/public sources) terminate HTTPS themselves and hand
+        # back their own certificate instead of properly tunneling tuta.com's
+        # real one - accepting that would mean the proxy can read and modify
+        # everything "encrypted" going through it, credentials included, so
+        # the connection must actually fail (ERR_CERT_AUTHORITY_INVALID) when
+        # that happens, not silently continue over a compromised channel. The
+        # pipeline already treats that failure like any other: this proxy's
+        # session ends, the identity is cleaned up, and a different proxy
+        # gets tried for the next one - never running a signup over a
+        # connection whose security the proxy has undermined.
         browser_context = await browser.new_context(
-            locale="cs-CZ", viewport={"width": 1366, "height": 900}, ignore_https_errors=True,
+            locale="cs-CZ", viewport={"width": 1366, "height": 900},
         )
         # Playwright's default action/navigation timeout (30s) was tuned for
         # a direct connection - a residential proxy adds real latency (and

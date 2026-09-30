@@ -33,7 +33,38 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def queue(identity_id: UUID, provider: str, display_name: Optional[str] = None) -> None:
+    """Records an identity that has been created and handed to the pipeline
+    scheduler but is still waiting for one of its slots (see
+    app.workers.pipeline_scheduler). Without this, everything between "Generate"
+    being clicked and a slot actually opening up is invisible on the
+    Pipelines/Monitoring pages - which, with a concurrency cap, can be a while.
+
+    No steps yet: which steps a run has comes from the provider pipeline, and
+    start() fills that in when the run actually begins."""
+    _progress[identity_id] = {
+        "identity_id": str(identity_id),
+        "display_name": display_name,
+        "provider": provider,
+        "status": "queued",
+        "step_index": -1,
+        "step_name": None,
+        "manual": False,
+        "steps": [],
+        "proxy": None,
+        "error": None,
+        "email": None,
+        "logs": [f"{_now()} queued - waiting for a free pipeline slot"],
+        "started_at": _now(),
+        "updated_at": _now(),
+    }
+
+
 def start(identity_id: UUID, provider: str, steps: list[dict], display_name: Optional[str] = None) -> None:
+    # Carried over from a preceding queue() entry so the wait for a slot stays
+    # in the run's own log rather than being wiped the moment it starts.
+    existing = _progress.get(identity_id)
+    logs = list(existing["logs"]) if existing else []
     _progress[identity_id] = {
         "identity_id": str(identity_id),
         "display_name": display_name,
@@ -46,7 +77,7 @@ def start(identity_id: UUID, provider: str, steps: list[dict], display_name: Opt
         "proxy": None,
         "error": None,
         "email": None,
-        "logs": [],
+        "logs": logs,
         "started_at": _now(),
         "updated_at": _now(),
     }

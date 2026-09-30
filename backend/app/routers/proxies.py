@@ -17,10 +17,29 @@ async def list_proxies(
     country: Optional[str] = Query(None),
     is_healthy: Optional[bool] = Query(None),
     assigned: Optional[bool] = Query(None),
+    retired: Optional[bool] = Query(
+        None,
+        description=(
+            "False hides proxies permanently out of circulation (used by a pipeline, or retired "
+            "after failing in real use); True shows only those. Their rows are kept so a later "
+            "scrape cannot re-import the same address, so they pile up - the Proxies page asks "
+            "for retired=false."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(get_current_user),
 ):
-    return await proxy_service.get_proxies(db, type=type, country=country, is_healthy=is_healthy, assigned=assigned)
+    return await proxy_service.get_proxies(
+        db, type=type, country=country, is_healthy=is_healthy, assigned=assigned, retired=retired,
+    )
+
+
+@router.get("/stats")
+async def proxy_stats(db: AsyncSession = Depends(get_db), _: str = Depends(get_current_user)):
+    """Pool totals, including how many proxies have been retired - counted in
+    the database rather than by fetching the rows, since the retired set grows
+    without bound by design."""
+    return await proxy_service.count_proxies(db)
 
 
 @router.post("", response_model=ProxyResponse, status_code=201)

@@ -16,8 +16,10 @@ def _fake_proxy() -> SimpleNamespace:
     it to return_value=None the way they used to when a proxy was optional;
     that would make the pipeline fail before provider.run() is ever called,
     which isn't what those tests are actually about. Has every attribute
-    _proxy_to_playwright_config and the proxy-found log line touch."""
+    _proxy_to_playwright_config, the proxy-found log line, and retire_proxy
+    touch."""
     return SimpleNamespace(
+        id=uuid.uuid4(),
         host="203.0.113.1", port=8080, username=None, password=None,
         protocol=SimpleNamespace(value="http"), type=SimpleNamespace(value="residential"), country="US",
     )
@@ -25,10 +27,23 @@ def _fake_proxy() -> SimpleNamespace:
 
 @pytest.fixture
 async def email_platform(client, auth_headers):
-    # Name deliberately doesn't match any entry in the automated-provider
-    # registry (only "tuta" is registered) - the background email pipeline
-    # then fails fast with a clear "no pipeline for this provider" error
-    # instead of launching a real browser during tests.
+    # Named for a provider that IS in the automated-provider registry: creating
+    # an identity without an email is now refused outright (422) for a provider
+    # with no pipeline behind it, rather than being accepted and then quietly
+    # cleaned up. Nothing actually runs - conftest's autouse queued_pipelines
+    # fixture intercepts the hand-off to the scheduler.
+    resp = await client.post(
+        "/api/email-platforms",
+        json={"type": "temporary", "name": "tuta", "domain": "tuta.com"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
+    return resp.json()
+
+
+@pytest.fixture
+async def unautomated_email_platform(client, auth_headers):
+    """A platform whose name matches no registered signup pipeline."""
     resp = await client.post(
         "/api/email-platforms",
         json={"type": "classic", "name": "test-provider", "domain": "example.com"},
@@ -70,7 +85,7 @@ async def test_generate_identity(client, auth_headers, email_platform):
     data = resp.json()
     assert "username" in data
     assert data["status"] == "fresh"
-    assert data["email"] is None  # attached later by the (here: unregistered) email pipeline
+    assert data["email"] is None  # attached later, once the queued pipeline runs
 
 
 @pytest.mark.asyncio
@@ -131,18 +146,75 @@ async def test_delete_identity(client, auth_headers, email_platform):
 
 
 @pytest.mark.asyncio
-async def test_pipeline_status_reflects_unsupported_provider(client, auth_headers, email_platform):
-    create = await client.post(
+async def test_unautomated_provider_is_refused_before_any_identity_is_written(
+    client, auth_headers, unautomated_email_platform, queued_pipelines
+):
+    """A provider with no signup pipeline behind it is rejected up front rather
+    than accepted and then cleaned up. It used to be the latter: the identity
+    was created, the pipeline failed immediately with "no pipeline for this
+    provider", and the identity was deleted again - a confusing round trip for
+    something knowable from the request alone."""
+    before = await client.get("/api/identities", headers=auth_headers)
+    resp = await client.post(
         "/api/identities/generate",
-        json={"email_platform_id": email_platform["id"]},
+        json={"email_platform_id": unautomated_email_platform["id"]},
         headers=auth_headers,
     )
-    identity_id = create.json()["id"]
-    resp = await client.get(f"/api/identities/{identity_id}/pipeline-status", headers=auth_headers)
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["status"] == "failed"
-    assert "test-provider" in data["error"]
+    assert resp.status_code == 422
+    assert "test-provider" in resp.json()["detail"]
+    assert queued_pipelines == []
+    after = await client.get("/api/identities", headers=auth_headers)
+    assert len(after.json()) == len(before.json())
+
+
+@pytest.mark.asyncio
+async def test_creating_an_identity_queues_it_instead_of_starting_a_pipeline(
+    client, auth_headers, email_platform, queued_pipelines
+):
+    """The request returns as soon as the row is written - it must not wait on a
+    proxy search or a browser. All it does is hand the identity to the
+    scheduler, which caps how many pipelines run at once."""
+    resp = await client.post(
+        "/api/identities",
+        json={
+            "display_name": "Queued Person",
+            "username": "queued_person_001",
+            "location": "US",
+            "age": 31,
+            "password": "secret123",
+            "email_platform_id": email_platform["id"],
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
+    identity_id = resp.json()["id"]
+
+    assert len(queued_pipelines) == 1
+    queued_identity_id, queued_platform_id, provider_name = queued_pipelines[0]
+    assert str(queued_identity_id) == identity_id
+    assert str(queued_platform_id) == email_platform["id"]
+    assert provider_name == "tuta"
+
+
+@pytest.mark.asyncio
+async def test_identity_with_a_pooled_email_is_not_queued(client, auth_headers, queued_pipelines):
+    """Supplying an existing address means there's no mailbox to create, so
+    there's nothing for the scheduler to do."""
+    resp = await client.post(
+        "/api/identities",
+        json={
+            "display_name": "Has Mail",
+            "username": "has_mail_001",
+            "email": "has.mail@tempmail.fake",
+            "email_provider": "mail.tm",
+            "location": "US",
+            "age": 24,
+            "password": "secret123",
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
+    assert queued_pipelines == []
 
 
 @pytest.mark.asyncio
@@ -411,6 +483,46 @@ async def test_select_and_test_proxy_uses_assigned_proxy_without_retesting_or_sc
 
 
 @pytest.mark.asyncio
+async def test_select_and_test_proxy_uses_an_assigned_datacenter_proxy_rather_than_leaking_it():
+    """The assigned fast path must not re-apply the residential/mobile
+    preference. The pipeline scheduler only escalates to a datacenter proxy
+    after exhausting the alternatives, and it reserves that proxy for the
+    identity before creating it - so refusing it here would both discard a
+    proxy just proven alive and leak the reservation: the row would stay
+    assigned to this identity forever while the pipeline went off to scrape,
+    with nothing left to hand it back."""
+    from app.database import AsyncSessionLocal, Base, engine
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    identity_id = uuid.uuid4()
+    async with AsyncSessionLocal() as db:
+        proxy = Proxy(
+            host="203.0.113.41", port=3128, protocol=ProxyProtocol.http, type=ProxyType.datacenter,
+            country="UN", provider="test-assigned-datacenter", assigned_bot_id=identity_id,
+        )
+        db.add(proxy)
+        await db.commit()
+        await db.refresh(proxy)
+        proxy_id = proxy.id
+
+    with patch("app.services.identity_service.check_proxy_health") as mock_check, \
+         patch("app.services.identity_service.proxy_service.import_proxies_from_free_list") as mock_import:
+        async with AsyncSessionLocal() as db:
+            result = await identity_service._select_and_test_proxy(db, identity_id, log=lambda _m: None)
+
+    assert result is not None
+    assert result.id == proxy_id
+    mock_check.assert_not_called()
+    mock_import.assert_not_called()
+
+    async with AsyncSessionLocal() as db:
+        assert (await db.get(Proxy, proxy_id)).consumed_at is not None
+
+
+@pytest.mark.asyncio
 async def test_consumed_proxy_never_becomes_selectable_again_even_after_identity_deleted():
     """Regression test for exactly the failure mode reported live (Tuta
     blocking an IP for suspected abuse): a proxy must never be handed to a
@@ -477,7 +589,7 @@ async def test_consumed_proxy_never_becomes_selectable_again_even_after_identity
             "host": "198.51.100.44", "port": 8080, "protocol": "http",
             "type": "residential", "country": "US", "provider": "free-proxy-list",
         }],
-    ):
+    ), patch("app.services.proxy_service.fetch_proxies_from_proxyscrape", return_value=[]):
         async with AsyncSessionLocal() as db:
             result = await real_proxy_service.import_proxies_from_free_list(db)
     assert result["imported"] == 0
@@ -490,14 +602,14 @@ async def test_consumed_proxy_never_becomes_selectable_again_even_after_identity
 @pytest.mark.asyncio
 async def test_select_and_test_proxy_keeps_retrying_across_rounds_until_one_is_alive():
     """A proxy is mandatory - _select_and_test_proxy must not give up after a
-    single scrape+test pass just because everything tried so far was dead.
-    The query is uncapped per round now (tests every untested candidate, not
-    just a top-N slice), so to make "found on round 2" actually deterministic
-    rather than depending on how many other untested proxies this shared,
-    real, session-accumulated DB happens to already have lying around, every
-    other untested residential/mobile candidate is marked consumed first -
-    leaving exactly one real candidate, whose health only flips to alive
-    starting on the second time it's tested."""
+    single test pass just because everything in the pool right now is dead. It
+    makes progress by importing NEW candidates, never by re-testing ones already
+    found dead: a failed check flags the proxy, and flagged proxies are filtered
+    out of later rounds entirely (which is what keeps "each proxy tested once"
+    true across rounds, not just within one).
+
+    Every other untested candidate is marked consumed first so this runs against
+    exactly two known rows in the shared, session-accumulated DB."""
     from datetime import datetime, timezone
     from sqlalchemy import update as sa_update
     from app.database import AsyncSessionLocal, Base, engine
@@ -515,34 +627,51 @@ async def test_select_and_test_proxy_keeps_retrying_across_rounds_until_one_is_a
         await db.commit()
 
     identity_id = uuid.uuid4()
+    dead_host, live_host = "203.0.113.50", "203.0.113.52"
     async with AsyncSessionLocal() as db:
-        proxy = Proxy(
-            host="203.0.113.50", port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+        db.add(Proxy(
+            host=dead_host, port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
             country="US", provider="retry-test",
-        )
-        db.add(proxy)
+        ))
         await db.commit()
 
     health_calls = []
 
     def fake_check_health(host, port, protocol, **_kwargs):
         health_calls.append(host)
-        return len(health_calls) >= 2  # dead on round 1, alive from round 2 on
+        return host == live_host
+
+    async def fake_import(db):
+        """Stands in for the scrape a later round does: brings in one new,
+        working candidate."""
+        db.add(Proxy(
+            host=live_host, port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+            country="US", provider="retry-test-round-2",
+        ))
+        await db.commit()
+        return {"imported": 1, "skipped": 0}
 
     with patch("app.services.identity_service.MAX_PROXY_SCRAPE_ROUNDS", 5), \
          patch("app.services.identity_service.PROXY_SCRAPE_ROUND_DELAY_S", 0), \
          patch("app.services.identity_service.check_proxy_health", side_effect=fake_check_health), \
          patch(
              "app.services.identity_service.proxy_service.import_proxies_from_free_list",
-             return_value={"imported": 0, "skipped": 0},
+             side_effect=fake_import,
          ) as mock_import:
         async with AsyncSessionLocal() as db:
             result = await identity_service._select_and_test_proxy(db, identity_id)
 
     assert result is not None
-    assert result.host == "203.0.113.50"
-    assert len(health_calls) == 2  # found on round 2, never tried a 3rd round
-    assert mock_import.call_count == 2  # scraped once per round, stopped once it succeeded
+    assert result.host == live_host
+    # Round 1 tested the dead one; round 2 tested only the newly imported one.
+    # The dead proxy must NOT appear twice - once flagged, it's out until the
+    # next import replaces it.
+    assert health_calls == [dead_host, live_host]
+    # Round 1 deliberately doesn't scrape - it tests the pool exactly as the
+    # refresher worker left it, which is normally fresher than a scrape here
+    # would be. Only round 2 onwards scrapes, so reaching round 2 means exactly
+    # one scrape happened.
+    assert mock_import.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -580,7 +709,9 @@ async def test_select_and_test_proxy_gives_up_after_round_budget_exhausted():
             result = await identity_service._select_and_test_proxy(db, identity_id)
 
     assert result is None
-    assert mock_import.call_count == 3  # tried every round in the budget, then stopped
+    # Every round in the budget was tried, then it stopped. One fewer scrape
+    # than rounds: round 1 works with the pool as-is (see the sibling test).
+    assert mock_import.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -708,3 +839,432 @@ async def test_session_timeout_closes_a_session_that_never_resolves():
     status = identity_service.get_pipeline_status(identity_id)
     assert status["status"] == "failed"
     assert "session exceeded" in status["error"]
+
+
+async def _make_proxies(hosts: list[str], provider: str):
+    """Real Proxy rows, returned as ids - retire_proxy updates by id, so
+    asserting on retirement needs actual rows rather than stand-ins."""
+    from app.database import AsyncSessionLocal, Base, engine
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    ids = []
+    async with AsyncSessionLocal() as db:
+        for host in hosts:
+            proxy = Proxy(
+                host=host, port=8080, protocol=ProxyProtocol.http, type=ProxyType.residential,
+                country="US", provider=provider,
+            )
+            db.add(proxy)
+            await db.flush()
+            ids.append(proxy.id)
+        await db.commit()
+    return ids
+
+
+def _hand_out_in_order(proxy_ids: list):
+    """Stands in for _select_and_test_proxy, giving each attempt the next proxy
+    in the list so a test can say exactly which proxy failed when."""
+    from app.database import AsyncSessionLocal
+    from app.models.proxy import Proxy
+
+    handed: list = []
+
+    async def fake_select(db, identity_id, log=lambda _m: None):
+        async with AsyncSessionLocal() as session:
+            proxy = await session.get(Proxy, proxy_ids[len(handed)])
+        handed.append(proxy.id)
+        return proxy
+
+    return fake_select, handed
+
+
+@pytest.mark.asyncio
+async def test_pipeline_retires_a_failed_proxy_and_retries_the_whole_run_on_another():
+    """The reported failure mode: a proxy passes its health check, then Chrome
+    reports net::ERR_TIMED_OUT the moment the browser actually navigates through
+    it. That says nothing about whether the signup would work, so the run
+    retires that proxy and starts over on a fresh one instead of failing.
+
+    Also covers the boundary: once a failure is NOT the proxy's fault, retrying
+    stops immediately (and that proxy is not flagged - it did its job)."""
+    from app.database import AsyncSessionLocal
+    from app.models.proxy import Proxy
+
+    identity_id = uuid.uuid4()
+    proxy_ids = await _make_proxies(["203.0.113.70", "203.0.113.71", "203.0.113.72"], "flag-test")
+    fake_select, handed = _hand_out_in_order(proxy_ids)
+
+    attempts = []
+
+    async def fake_run(**_):
+        attempts.append(1)
+        if len(attempts) <= 2:
+            # Exactly what Playwright surfaces for a dead proxy.
+            raise RuntimeError('Page.goto: net::ERR_TIMED_OUT at https://tuta.com/cs')
+        raise RuntimeError("step_submit_account: signup button never became visible")
+
+    fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [])
+
+    with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
+         patch("app.services.identity_service._select_and_test_proxy", side_effect=fake_select):
+        await identity_service.start_email_pipeline_for_identity(
+            identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
+        )
+
+    assert len(attempts) == 3, "each proxy-level failure should retry on a new proxy"
+    assert handed == proxy_ids, "each attempt must get a different proxy"
+
+    async with AsyncSessionLocal() as db:
+        first, second, third = [await db.get(Proxy, pid) for pid in proxy_ids]
+        for row in (first, second):
+            # Flagged as not working, which is what keeps any other identity
+            # from picking it up...
+            assert row.is_healthy is False
+            assert row.assigned_bot_id is None
+            # ...but NOT blacklisted. consumed_at means "an account was
+            # registered through this IP" and is permanent; these never got a
+            # byte through, so the next import is free to bring them back.
+            assert row.consumed_at is None
+        # The third failed for a reason that wasn't its fault, so it's left
+        # completely untouched - not flagged. (In a real run it would also still
+        # be consumed by the attempt that used it; _select_and_test_proxy, which
+        # is what consumes, is stubbed out here.)
+        assert third.is_healthy is True
+
+    status = identity_service.get_pipeline_status(identity_id)
+    assert status["status"] == "failed"
+    assert "signup button never became visible" in status["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_flagged_proxy_is_hidden_from_searches_but_returns_on_the_next_import():
+    """The exact contract asked for: a proxy that failed in use is out of reach
+    of every other identity, yet is not blacklisted - the refresher's next cycle
+    drops it with the rest of the stale pool and re-imports it from the source as
+    a fresh, healthy candidate."""
+    from app.database import AsyncSessionLocal
+    from app.models.proxy import Proxy
+    from app.services import proxy_service as real_proxy_service
+
+    host = "203.0.113.150"
+    (proxy_id,) = await _make_proxies([host], "flag-then-reimport-test")
+
+    await identity_service.flag_proxy_not_working(proxy_id, "test")
+
+    # Invisible to every candidate search while flagged.
+    async with AsyncSessionLocal() as db:
+        candidates = await identity_service.list_free_proxy_candidates(db, allow_datacenter=True)
+        assert proxy_id not in {c.id for c in candidates}
+        # Not blacklisted: still a plain free row, just a dead one.
+        row = await db.get(Proxy, proxy_id)
+        assert row.consumed_at is None and row.is_healthy is False
+
+    # The refresher replaces the free pool; the source still lists this address.
+    scraped = [{
+        "host": host, "port": 8080, "protocol": "http",
+        "type": "residential", "country": "US", "provider": "free-proxy-list",
+    }]
+    with patch("app.services.proxy_service.fetch_all_free_proxies", return_value=scraped):
+        async with AsyncSessionLocal() as db:
+            result = await real_proxy_service.replace_free_proxy_pool(db)
+
+    assert result.get("error") is None
+    assert result["imported"] >= 1, "a flagged proxy must be re-importable, not permanently skipped"
+
+    async with AsyncSessionLocal() as db:
+        # Back as a brand new row (the old one was dropped with the stale pool),
+        # healthy, and selectable again.
+        candidates = await identity_service.list_free_proxy_candidates(db, allow_datacenter=True)
+        assert host in {c.host for c in candidates}
+        assert await db.get(Proxy, proxy_id) is None
+
+
+@pytest.mark.asyncio
+async def test_pipeline_gives_up_after_its_proxy_attempt_budget():
+    """Unbounded retrying would pin a scheduler slot and a Chromium instance
+    forever against a pool where nothing works, so the run stops after
+    MAX_PROXY_ATTEMPTS_PER_RUN - having flagged every proxy it tried."""
+    from app.database import AsyncSessionLocal
+    from app.models.proxy import Proxy
+
+    identity_id = uuid.uuid4()
+    proxy_ids = await _make_proxies(["203.0.113.80", "203.0.113.81", "203.0.113.82"], "budget-test")
+    fake_select, _handed = _hand_out_in_order(proxy_ids)
+
+    attempts = []
+
+    async def fake_run(**_):
+        attempts.append(1)
+        raise RuntimeError('Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://tuta.com/cs')
+
+    fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [])
+
+    with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
+         patch("app.services.identity_service._select_and_test_proxy", side_effect=fake_select), \
+         patch("app.services.identity_service.MAX_PROXY_ATTEMPTS_PER_RUN", 3):
+        await identity_service.start_email_pipeline_for_identity(
+            identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
+        )
+
+    assert len(attempts) == 3
+    async with AsyncSessionLocal() as db:
+        for pid in proxy_ids:
+            row = await db.get(Proxy, pid)
+            assert row.is_healthy is False
+            assert row.consumed_at is None  # flagged, not blacklisted
+
+    status = identity_service.get_pipeline_status(identity_id)
+    assert status["status"] == "failed"
+    assert "gave up after 3 proxies" in status["error"]
+    assert "ERR_TUNNEL_CONNECTION_FAILED" in status["error"]
+
+
+@pytest.mark.asyncio
+async def test_hung_sessions_get_a_much_smaller_retry_budget_than_fast_failures():
+    """A Chrome network error comes back in seconds, so trying 25 proxies costs
+    little. A hung session costs minutes each, so retrying it 25 times would
+    hold a slot for hours - it gets its own small allowance."""
+    identity_id = uuid.uuid4()
+    proxy_ids = await _make_proxies(["203.0.113.90", "203.0.113.91", "203.0.113.92"], "hang-test")
+    fake_select, _handed = _hand_out_in_order(proxy_ids)
+
+    attempts = []
+
+    async def fake_run(**_):
+        attempts.append(1)
+        await asyncio.sleep(3600)  # hangs rather than erroring, like a half-dead proxy
+
+    fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [])
+
+    with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
+         patch("app.services.identity_service._select_and_test_proxy", side_effect=fake_select), \
+         patch("app.services.identity_service.STEP_STALL_TIMEOUT_S", 0.05), \
+         patch("app.services.identity_service.MAX_HUNG_SESSIONS_PER_RUN", 2), \
+         patch("app.services.identity_service.MAX_PROXY_ATTEMPTS_PER_RUN", 25):
+        await asyncio.wait_for(
+            identity_service.start_email_pipeline_for_identity(
+                identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
+            ),
+            timeout=10,
+        )
+
+    assert len(attempts) == 2, "hung sessions must not consume the full proxy budget"
+    status = identity_service.get_pipeline_status(identity_id)
+    assert status["status"] == "failed"
+    assert "session(s) hung" in status["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_step_that_stops_advancing_terminates_the_session():
+    """A run that never changes step is killed after STEP_STALL_TIMEOUT_S rather
+    than sitting there holding a browser. The provider here reaches its first
+    step and then hangs forever - exactly what a page that will never resolve
+    looks like from out here."""
+    identity_id = uuid.uuid4()
+    (proxy_id,) = await _make_proxies(["203.0.113.100"], "stall-test")
+    fake_select, _handed = _hand_out_in_order([proxy_id])
+
+    cancelled = asyncio.Event()
+
+    async def fake_run(on_step=None, **_):
+        on_step(0, SimpleNamespace(name="open_homepage", manual=False))
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            # The provider's own `finally: browser.close()` runs at this point -
+            # the guard has to await the cancellation for that to happen.
+            cancelled.set()
+            raise
+
+    fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [])
+
+    with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
+         patch("app.services.identity_service._select_and_test_proxy", side_effect=fake_select), \
+         patch("app.services.identity_service.STEP_STALL_TIMEOUT_S", 0.2), \
+         patch("app.services.identity_service.SESSION_TIMEOUT_S", 30), \
+         patch("app.services.identity_service.MAX_HUNG_SESSIONS_PER_RUN", 1):
+        await asyncio.wait_for(
+            identity_service.start_email_pipeline_for_identity(
+                identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
+            ),
+            timeout=10,
+        )
+
+    assert cancelled.is_set(), "the stalled run must be cancelled, not abandoned"
+    status = identity_service.get_pipeline_status(identity_id)
+    assert status["status"] == "failed"
+    assert "no pipeline step change" in status["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_keeps_advancing_is_never_killed_for_being_slow():
+    """The guard watches for progress, not duration. A run whose steps each take
+    most of the stall window but keep coming must be left alone - the whole
+    reason every internal wait is unbounded is that a slow page shouldn't fail a
+    step."""
+    identity_id = uuid.uuid4()
+    (proxy_id,) = await _make_proxies(["203.0.113.101"], "slow-but-moving-test")
+    fake_select, _handed = _hand_out_in_order([proxy_id])
+
+    async def fake_run(on_step=None, **_):
+        # Six steps, each taking most of the stall allowance: far past it in
+        # total, but never stalled.
+        for index in range(6):
+            on_step(index, SimpleNamespace(name=f"step_{index}", manual=False))
+            await asyncio.sleep(0.15)
+        return SimpleNamespace(username="slowbutsteady123456", password="Sunshine1234!")
+
+    fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [])
+
+    with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
+         patch("app.services.identity_service._select_and_test_proxy", side_effect=fake_select), \
+         patch("app.services.identity_service.STEP_STALL_TIMEOUT_S", 0.25), \
+         patch("app.services.identity_service.SESSION_TIMEOUT_S", 30):
+        await asyncio.wait_for(
+            identity_service.start_email_pipeline_for_identity(
+                identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
+            ),
+            timeout=10,
+        )
+
+    # These tests never create an Identity row, so attaching the mailbox
+    # afterwards fails on its own - which is fine. What matters is that the run
+    # was allowed to reach that point at all, i.e. the guard did not kill it.
+    status = identity_service.get_pipeline_status(identity_id)
+    assert "no pipeline step change" not in (status.get("error") or ""), status["error"]
+    assert "session exceeded" not in (status.get("error") or ""), status["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_manual_step_is_exempt_from_the_stall_timeout():
+    """A step waiting on a person is stalled by design. Putting a three-minute
+    stopwatch on it would just be a race against how fast someone notices the
+    dashboard."""
+    identity_id = uuid.uuid4()
+    (proxy_id,) = await _make_proxies(["203.0.113.102"], "manual-step-test")
+    fake_select, _handed = _hand_out_in_order([proxy_id])
+
+    async def fake_run(on_step=None, **_):
+        on_step(0, SimpleNamespace(name="manual_captcha", manual=True))
+        # Far longer than the stall allowance - and legitimately so.
+        await asyncio.sleep(0.6)
+        on_step(1, SimpleNamespace(name="after_captcha", manual=False))
+        return SimpleNamespace(username="waitedforahuman12345", password="Sunshine1234!")
+
+    fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [])
+
+    with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
+         patch("app.services.identity_service._select_and_test_proxy", side_effect=fake_select), \
+         patch("app.services.identity_service.STEP_STALL_TIMEOUT_S", 0.15), \
+         patch("app.services.identity_service.SESSION_TIMEOUT_S", 30):
+        await asyncio.wait_for(
+            identity_service.start_email_pipeline_for_identity(
+                identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
+            ),
+            timeout=10,
+        )
+
+    # These tests never create an Identity row, so attaching the mailbox
+    # afterwards fails on its own - which is fine. What matters is that the run
+    # was allowed to reach that point at all, i.e. the guard did not kill it.
+    status = identity_service.get_pipeline_status(identity_id)
+    assert "no pipeline step change" not in (status.get("error") or ""), status["error"]
+    assert "session exceeded" not in (status.get("error") or ""), status["error"]
+
+
+@pytest.mark.asyncio
+async def test_ip_blocked_banner_counts_as_a_proxy_failure():
+    """Tuta's "this IP is blocked for suspected abuse" banner means the proxy's
+    address is burned for this site. The proxy works fine at the network level,
+    so no Chrome error appears - but a different proxy is still the only fix,
+    and the same one must never be offered again."""
+    from app.database import AsyncSessionLocal
+    from app.models.proxy import Proxy
+
+    identity_id = uuid.uuid4()
+    proxy_ids = await _make_proxies(["203.0.113.95", "203.0.113.96"], "ipblock-test")
+    fake_select, _handed = _hand_out_in_order(proxy_ids)
+
+    attempts = []
+
+    async def fake_run(**_):
+        attempts.append(1)
+        # Exactly what tuta.py's _raise_if_ip_blocked raises.
+        raise RuntimeError("ip_blocked: Tuta blocked this IP for suspected abuse - closing the session")
+
+    fake_provider = ProviderPipeline(run=fake_run, describe=lambda: [])
+
+    with patch("app.services.identity_service.get_provider_pipeline", return_value=fake_provider), \
+         patch("app.services.identity_service._select_and_test_proxy", side_effect=fake_select), \
+         patch("app.services.identity_service.MAX_PROXY_ATTEMPTS_PER_RUN", 2):
+        await identity_service.start_email_pipeline_for_identity(
+            identity_id, "fake-provider", "example.com", uuid.uuid4(), "classic"
+        )
+
+    assert len(attempts) == 2, "an IP-blocked proxy should be swapped, not retried on"
+    async with AsyncSessionLocal() as db:
+        for pid in proxy_ids:
+            row = await db.get(Proxy, pid)
+            assert row.is_healthy is False
+            # No account was registered - Tuta refused before that - so this is
+            # a flag, not a blacklist entry.
+            assert row.consumed_at is None
+
+
+@pytest.mark.asyncio
+async def test_select_and_test_proxy_falls_back_to_datacenter_as_last_resort():
+    """Residential/mobile is strongly preferred (more likely to work cleanly
+    against a real site's anti-abuse heuristics), but a proxy is mandatory -
+    refusing to run at all when only a datacenter proxy exists is worse than
+    using one. Only a datacenter proxy is available here; every round before
+    the last one must skip it (so it must NOT be picked early), and only the
+    final, last-resort round may pick it up.
+
+    check_proxy_health is patched to always succeed, so - same isolation
+    concern as the round-retry tests above - every other untested
+    residential/mobile candidate in this shared, session-accumulated DB is
+    marked consumed first, or one of *those* would win on round 1 instead of
+    this test ever reaching the last-resort round at all."""
+    from datetime import datetime, timezone
+    from sqlalchemy import update as sa_update
+    from app.database import AsyncSessionLocal, Base, engine
+    from app.models.proxy import Proxy, ProxyProtocol, ProxyType
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            sa_update(Proxy)
+            .where(Proxy.assigned_bot_id.is_(None), Proxy.consumed_at.is_(None))
+            .values(consumed_at=datetime.now(timezone.utc))
+        )
+        await db.commit()
+
+    identity_id = uuid.uuid4()
+    async with AsyncSessionLocal() as db:
+        proxy = Proxy(
+            host="203.0.113.70", port=8080, protocol=ProxyProtocol.http, type=ProxyType.datacenter,
+            country="US", provider="last-resort-test",
+        )
+        db.add(proxy)
+        await db.commit()
+        await db.refresh(proxy)
+        proxy_id = proxy.id
+
+    with patch("app.services.identity_service.MAX_PROXY_SCRAPE_ROUNDS", 3), \
+         patch("app.services.identity_service.PROXY_SCRAPE_ROUND_DELAY_S", 0), \
+         patch("app.services.identity_service.check_proxy_health", return_value=True), \
+         patch(
+             "app.services.identity_service.proxy_service.import_proxies_from_free_list",
+             return_value={"imported": 0, "skipped": 0},
+         ):
+        async with AsyncSessionLocal() as db:
+            result = await identity_service._select_and_test_proxy(db, identity_id)
+
+    assert result is not None
+    assert result.id == proxy_id
+    assert result.type == ProxyType.datacenter

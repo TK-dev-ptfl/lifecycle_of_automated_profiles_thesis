@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { getProxies, createProxy, deleteProxy, testProxy, cleanupUnhealthyProxies, fetchProxiesFromFreeList } from '../../api/proxies'
+import { getProxies, getProxyStats, createProxy, deleteProxy, testProxy, cleanupUnhealthyProxies, fetchProxiesFromFreeList } from '../../api/proxies'
 import { Card } from '../../components/ui/Card'
 import { DataTable, Column } from '../../components/ui/DataTable'
 import { Badge } from '../../components/ui/Badge'
@@ -15,16 +15,32 @@ export default function ProxiesPage() {
   const qc = useQueryClient()
   const [showCreate, setShowCreate] = useState(false)
   const [healthFilter, setHealthFilter] = useState('')
+  // Retired proxies (used by a pipeline, or retired after failing in real use)
+  // are hidden by default. Their rows exist only so a later scrape can't
+  // re-import the same address - they're never selectable again, and there are
+  // thousands of them, so showing them by default buries the live pool.
+  const [showRetired, setShowRetired] = useState(false)
   const [newProxy, setNewProxy] = useState<Partial<Proxy>>({ host: '', port: 8080, protocol: 'http', type: 'datacenter', country: 'US', provider: 'custom' })
 
   const { data: proxies = [], isLoading } = useQuery({
-    queryKey: ['proxies', healthFilter],
-    queryFn: () => getProxies(healthFilter !== '' ? { is_healthy: healthFilter } : {}),
+    queryKey: ['proxies', healthFilter, showRetired],
+    queryFn: () => getProxies({
+      ...(healthFilter !== '' ? { is_healthy: healthFilter } : {}),
+      ...(showRetired ? {} : { retired: 'false' }),
+    }),
+    refetchInterval: 15000,
+  })
+
+  const { data: stats } = useQuery({
+    queryKey: ['proxies', 'stats'],
+    queryFn: getProxyStats,
     refetchInterval: 15000,
   })
 
   const testAllSequentially = async () => {
-    const allProxies = await getProxies()
+    // Only the live pool - re-testing retired proxies would be thousands of
+    // requests to confirm something already permanently excluded.
+    const allProxies = await getProxies({ retired: 'false' })
     const batchSize = 50
 
     for (let i = 0; i < allProxies.length; i += batchSize) {
@@ -43,7 +59,7 @@ export default function ProxiesPage() {
     mutationFn: fetchProxiesFromFreeList, 
     onSuccess: () => { 
       inv()
-      alert('Successfully fetched and imported proxies from free-proxy-list.net!')
+      alert('Successfully fetched and imported proxies from free-proxy-list.net and proxyscrape.com!')
     },
     onError: (error: any) => {
       alert(`Error fetching proxies: ${error.message}`)
@@ -65,7 +81,18 @@ export default function ProxiesPage() {
         </div>
       ),
     },
-    { key: 'assigned', header: 'Assigned', render: (p) => <span className="text-gray-500 text-xs">{p.assigned_bot_id ? '✓ Assigned' : '—'}</span> },
+    {
+      key: 'assigned', header: 'State',
+      render: (p) => (
+        p.consumed_at
+          ? <span className="text-red-400 text-xs" title="An account was registered through this IP - retired permanently, never offered again">retired</span>
+          : p.assigned_bot_id
+            ? <span className="text-amber-300 text-xs" title="Reserved for an identity whose pipeline hasn't run yet">reserved</span>
+            : !p.is_healthy
+              ? <span className="text-amber-400 text-xs" title="Failed its check or failed in a real run - not handed to any identity. Not blacklisted: the next import replaces it and it can come back">flagged</span>
+              : <span className="text-gray-500 text-xs">free</span>
+      ),
+    },
     { key: 'checked', header: 'Last Checked', render: (p) => <span className="text-gray-500 text-xs">{formatDistanceToNow(new Date(p.last_checked), { addSuffix: true })}</span> },
     {
       key: 'actions', header: '',
@@ -78,22 +105,27 @@ export default function ProxiesPage() {
     },
   ]
 
-  const healthy = proxies.filter(p => p.is_healthy).length
-
   return (
     <div className="space-y-5">
-      <div className="grid grid-cols-3 gap-4">
+      {/* Counted in the database (GET /api/proxies/stats) rather than from the
+          rows on screen - the retired set runs to thousands and is never
+          fetched. */}
+      <div className="grid grid-cols-4 gap-4">
         <div className="rounded-xl border border-gray-700/60 bg-gray-800/40 px-5 py-4">
-          <p className="text-2xl font-bold text-gray-200">{proxies.length}</p>
-          <p className="text-xs text-gray-500 mt-0.5">Total Proxies</p>
+          <p className="text-2xl font-bold text-gray-200">{stats?.available ?? 0}</p>
+          <p className="text-xs text-gray-500 mt-0.5">In the pool</p>
         </div>
         <div className="rounded-xl border border-gray-700/60 bg-gray-800/40 px-5 py-4">
-          <p className="text-2xl font-bold text-emerald-400">{healthy}</p>
+          <p className="text-2xl font-bold text-emerald-400">{stats?.available_healthy ?? 0}</p>
           <p className="text-xs text-gray-500 mt-0.5">Healthy</p>
         </div>
         <div className="rounded-xl border border-gray-700/60 bg-gray-800/40 px-5 py-4">
-          <p className="text-2xl font-bold text-red-400">{proxies.length - healthy}</p>
-          <p className="text-xs text-gray-500 mt-0.5">Down</p>
+          <p className="text-2xl font-bold text-amber-400">{(stats?.available ?? 0) - (stats?.available_healthy ?? 0)}</p>
+          <p className="text-xs text-gray-500 mt-0.5">Flagged — replaced next import</p>
+        </div>
+        <div className="rounded-xl border border-gray-700/60 bg-gray-800/40 px-5 py-4">
+          <p className="text-2xl font-bold text-red-400">{stats?.retired ?? 0}</p>
+          <p className="text-xs text-gray-500 mt-0.5">Used — never reused</p>
         </div>
       </div>
 
@@ -109,6 +141,10 @@ export default function ProxiesPage() {
               <option value="true">Healthy</option>
               <option value="false">Down</option>
             </select>
+            <label className="flex items-center gap-1.5 text-sm text-gray-400 whitespace-nowrap px-1">
+              <input type="checkbox" checked={showRetired} onChange={(e) => setShowRetired(e.target.checked)} />
+              Show retired
+            </label>
             <Button variant="secondary" loading={testAll.isPending} onClick={() => testAll.mutate()}>Test All</Button>
             <Button variant="danger" loading={cleanup.isPending} onClick={() => cleanup.mutate()}>Cleanup</Button>
             <Button variant="primary" loading={fetchFree.isPending} onClick={() => fetchFree.mutate()}>Get Proxies</Button>

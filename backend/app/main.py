@@ -1,3 +1,5 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +16,10 @@ from app.routers.algorithms import router as algorithms_router
 from app.routers.email_platforms import router as email_platforms_router
 from app.routers.emails import router as emails_router
 from app.routers.sandboxes import router as sandboxes_router
+from app.routers.workers import router as workers_router
+from app.services.identity_service import PROXY_TEST_BATCH_SIZE
+from app.workers.pipeline_scheduler import DEFAULT_CONCURRENCY, pipeline_scheduler
+from app.workers.proxy_refresher import proxy_refresher
 
 
 async def _ensure_sqlite_compat_columns() -> None:
@@ -71,7 +77,36 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await _ensure_sqlite_compat_columns()
-    yield
+
+    # Proxy health checks are blocking socket work dispatched through
+    # asyncio.to_thread, and this workload submits a great many of them at
+    # once: each scheduler slot tests PROXY_TEST_BATCH_SIZE candidates
+    # concurrently, so the default seven slots can have ~140 checks in flight,
+    # each waiting up to its own 10s timeout. The default executor is only
+    # min(32, cpu_count + 4) threads, which would queue most of those behind
+    # each other and stretch a 10-second round into a minute or more. A thread
+    # blocked on a socket costs almost nothing, so size the pool for the actual
+    # concurrency. (Raising the scheduler's concurrency well past the default
+    # via /api/workers would start queueing again - this is sized for the
+    # default, not unbounded.)
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(
+            max_workers=DEFAULT_CONCURRENCY * PROXY_TEST_BATCH_SIZE + 16,
+            thread_name_prefix="blocking",
+        )
+    )
+
+    # The refresher starts on its own: all it does is scrape two public lists
+    # and keep the Proxies page current, which should be true whether or not
+    # anyone is creating accounts right now. The scheduler does NOT - each of
+    # its slots drives a real Chromium instance and registers a real mailbox,
+    # so it waits for an explicit POST /api/workers/pipeline-scheduler/start.
+    proxy_refresher.start()
+    try:
+        yield
+    finally:
+        await pipeline_scheduler.stop()
+        await proxy_refresher.stop()
 
 
 app = FastAPI(title="Bot Management Dashboard", version="1.0.0", lifespan=lifespan)
@@ -95,6 +130,7 @@ app.include_router(algorithms_router)
 app.include_router(email_platforms_router)
 app.include_router(emails_router)
 app.include_router(sandboxes_router)
+app.include_router(workers_router)
 
 
 @app.get("/health")

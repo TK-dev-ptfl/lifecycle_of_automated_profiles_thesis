@@ -1476,6 +1476,9 @@ function statusBadgeClasses(status: PipelineStatus['status']): string {
     case 'completed': return 'bg-emerald-900/40 text-emerald-400 border-emerald-700/40'
     case 'waiting_manual': return 'bg-amber-900/40 text-amber-400 border-amber-700/40'
     case 'failed': return 'bg-red-900/40 text-red-400 border-red-700/40'
+    // Created and handed to the scheduler, but no slot free yet - not running,
+    // and deliberately not coloured like it is.
+    case 'queued': return 'bg-gray-800/60 text-gray-400 border-gray-600/50'
     default: return 'bg-blue-900/40 text-blue-400 border-blue-700/40'
   }
 }
@@ -1485,6 +1488,7 @@ function statusLabel(status: PipelineStatus['status']): string {
     case 'completed': return 'done'
     case 'waiting_manual': return 'waiting on captcha'
     case 'failed': return 'failed'
+    case 'queued': return 'queued'
     default: return 'running'
   }
 }
@@ -1520,6 +1524,10 @@ function ProxyBadge({ proxy, status }: { proxy: PipelineProxyInfo | null; status
     // Should never happen - a completed run always had a proxy. Flagged
     // loudly rather than looking like a normal "no proxy" state.
     return <span className="text-[10px] text-red-400">⚠ completed with no proxy recorded (unexpected)</span>
+  }
+  if (status === 'queued') {
+    // Nothing has looked for a proxy yet - the search is the slot's first act.
+    return <span className="text-[10px] text-gray-500">waiting for a free slot</span>
   }
   return (
     <span className="text-[10px] text-gray-500 inline-flex items-center gap-1">

@@ -65,6 +65,11 @@ export interface Proxy {
   provider: string
   assigned_bot_id?: string
   is_healthy: boolean
+  // Set once a pipeline has used this proxy, or it was retired after failing in
+  // real use. Permanent: a proxy with this set is never offered to another
+  // identity, and the row survives only so a later scrape can't re-import the
+  // same address. assigned_bot_id without this means merely reserved.
+  consumed_at?: string | null
   last_checked: string
   created_at: string
 }

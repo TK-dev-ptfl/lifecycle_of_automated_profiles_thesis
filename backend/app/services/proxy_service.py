@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
-from sqlalchemy import select, update as sa_update
+from sqlalchemy import case, delete as sa_delete, func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 import httpx
 from bs4 import BeautifulSoup
@@ -106,13 +106,83 @@ def fetch_proxies_from_free_proxy_list() -> list[dict]:
         return []
 
 
+PROXYSCRAPE_URL = (
+    "https://api.proxyscrape.com/v4/free-proxy-list/get"
+    "?request=display_proxies&proxy_format=protocolipport&format=text"
+)
+
+
+def fetch_proxies_from_proxyscrape() -> list[dict]:
+    """
+    Fetch proxies from proxyscrape.com synchronously. The protocolipport
+    text format returns one "protocol://ip:port" per line with no
+    country/anonymity data at all (unlike free-proxy-list.net's HTML table) -
+    country is left as the same "UN" (unknown) placeholder already used
+    elsewhere for a missing country, and type is left as datacenter rather
+    than guessing residential/mobile with literally nothing to base that on;
+    these can still surface as a last-resort candidate (see
+    identity_service._select_and_test_proxy) same as any other datacenter
+    proxy, just not preferred over ones we have better information about.
+    Returns a list of proxy dictionaries in the same shape as
+    fetch_proxies_from_free_proxy_list's, so both sources merge and import
+    identically.
+    """
+    try:
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            response = client.get(PROXYSCRAPE_URL)
+            response.raise_for_status()
+
+        proxies = []
+
+        for line in response.text.splitlines():
+            line = line.strip()
+            if not line or "://" not in line:
+                continue
+
+            protocol, _, hostport = line.partition("://")
+            protocol = protocol.strip().lower()
+            # Only protocols our own Proxy model actually represents (see
+            # ProxyProtocol) - this feed can also return socks4, which isn't
+            # one of them, so those lines are skipped rather than silently
+            # mislabeled as socks5 (a different protocol Chromium would then
+            # try to speak to a proxy that doesn't understand it).
+            if protocol not in ("http", "socks5"):
+                continue
+
+            host, _, port_str = hostport.strip().rpartition(":")
+            if not host or not port_str.isdigit():
+                continue
+
+            proxies.append({
+                "host": host,
+                "port": int(port_str),
+                "protocol": protocol,
+                "type": "datacenter",
+                "country": "UN",
+                "provider": "proxyscrape",
+            })
+
+        return proxies
+
+    except Exception as e:
+        print(f"Error fetching proxies from proxyscrape.com: {e}")
+        return []
+
+
 async def get_proxies(
     db: AsyncSession,
     type: Optional[str] = None,
     country: Optional[str] = None,
     is_healthy: Optional[bool] = None,
     assigned: Optional[bool] = None,
+    retired: Optional[bool] = None,
 ) -> list:
+    """retired filters on consumed_at: True = only proxies permanently out of
+    circulation (used by a pipeline, or retired after failing in real use),
+    False = only ones still available. Those rows are kept forever so a later
+    scrape can't re-import the same address (see the Proxy model), which means
+    they accumulate - retired=False is what keeps the Proxies page showing the
+    pool that actually matters rather than a graveyard."""
     q = select(Proxy)
     if type:
         q = q.where(Proxy.type == type)
@@ -124,8 +194,32 @@ async def get_proxies(
         q = q.where(Proxy.assigned_bot_id.isnot(None))
     elif assigned is False:
         q = q.where(Proxy.assigned_bot_id.is_(None))
+    if retired is True:
+        q = q.where(Proxy.consumed_at.isnot(None))
+    elif retired is False:
+        q = q.where(Proxy.consumed_at.is_(None))
     result = await db.execute(q)
     return result.scalars().all()
+
+
+async def count_proxies(db: AsyncSession) -> dict:
+    """Pool totals in one query instead of counting a full page of rows
+    client-side - the retired set runs to thousands, so it must never have to be
+    fetched just to be counted."""
+    result = await db.execute(
+        select(
+            func.count(Proxy.id),
+            func.sum(case((Proxy.consumed_at.isnot(None), 1), else_=0)),
+            func.sum(case(((Proxy.consumed_at.is_(None)) & (Proxy.is_healthy.is_(True)), 1), else_=0)),
+        )
+    )
+    total, retired, available_healthy = result.one()
+    return {
+        "total": total or 0,
+        "retired": int(retired or 0),
+        "available": (total or 0) - int(retired or 0),
+        "available_healthy": int(available_healthy or 0),
+    }
 
 
 async def get_proxy(db: AsyncSession, proxy_id: UUID) -> Optional[Proxy]:
@@ -247,42 +341,84 @@ async def test_all_proxies(db: AsyncSession) -> int:
 
 async def import_proxies_from_free_list(db: AsyncSession) -> dict:
     """
-    Fetch proxies from free-proxy-list.net and import them into the database.
-    Returns a dict with counts and status.
+    Fetch proxies from every configured free source - currently
+    free-proxy-list.net and proxyscrape.com - and import them into the
+    database. Returns a dict with counts and status.
 
-    fetch_proxies_from_free_proxy_list() is a plain sync function (httpx's
-    sync Client, BeautifulSoup parsing) that can take several seconds - run
-    via asyncio.to_thread so it doesn't block this process's single event
-    loop. That matters more now than it used to: identity_service calls this
-    at the start of every email pipeline run to refresh the pool with fresh
-    candidates, and pipelines are meant to run fully concurrently (see
+    Both fetchers are plain sync functions (httpx's sync Client, one with
+    BeautifulSoup parsing) that can each take several seconds - run via
+    asyncio.to_thread, concurrently, so neither blocks this process's single
+    event loop or waits on the other unnecessarily. That matters more now
+    than it used to: identity_service calls this at the start of every email
+    pipeline run to refresh the pool with fresh candidates, and pipelines are
+    meant to run fully concurrently (see
     test_two_pipelines_run_concurrently_not_one_after_another) - a blocking
     call here would stall every other pipeline for as long as the scrape
     takes.
+
+    Each fetcher already catches its own errors and returns [] rather than
+    raising, so one source being down doesn't stop the other's results from
+    being imported - only reported as an overall error if *both* come back
+    empty. import_proxies_from_free_list's own per-entry host:port dedup
+    check (below) handles the rare case of the same proxy appearing in both
+    sources transparently.
     """
-    proxy_data_list = await asyncio.to_thread(fetch_proxies_from_free_proxy_list)
-    
+    proxy_data_list = await fetch_all_free_proxies()
+
     if not proxy_data_list:
-        return {'imported': 0, 'skipped': 0, 'error': 'Failed to fetch proxies from free-proxy-list.net'}
-    
+        return {'imported': 0, 'skipped': 0, 'error': 'Failed to fetch proxies from any configured source (free-proxy-list.net, proxyscrape.com)'}
+
+    imported, skipped = await _insert_new_proxies(db, proxy_data_list)
+
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        return {'imported': imported, 'skipped': skipped, 'error': str(e)}
+
+    return {'imported': imported, 'skipped': skipped, 'message': f'Successfully imported {imported} proxies'}
+
+
+async def fetch_all_free_proxies() -> list[dict]:
+    """Scrapes every configured free source concurrently and returns the
+    merged, unfiltered result. Split out of import_proxies_from_free_list so
+    replace_free_proxy_pool can scrape *before* it throws the old list away -
+    see the ordering note there."""
+    proxy_data_list, proxyscrape_list = await asyncio.gather(
+        asyncio.to_thread(fetch_proxies_from_free_proxy_list),
+        asyncio.to_thread(fetch_proxies_from_proxyscrape),
+    )
+    return proxy_data_list + proxyscrape_list
+
+
+async def _insert_new_proxies(db: AsyncSession, proxy_data_list: list[dict]) -> tuple[int, int]:
+    """Adds every scraped entry whose host:port isn't already in the table,
+    returning (imported, skipped). Does not commit - the caller owns the
+    transaction, which is what lets replace_free_proxy_pool delete and
+    re-insert atomically.
+
+    The existing host:port set is read once up front rather than with a SELECT
+    per entry: proxyscrape alone returns ~1800 rows per scrape, and this runs
+    every two minutes on the refresher worker's cycle. Rows already deleted
+    earlier in this same transaction are correctly absent from that set, so a
+    proxy that was in the free pool a moment ago gets re-inserted fresh; a
+    *consumed* one (see the Proxy model's consumed_at) is still there and
+    still gets skipped, which is exactly what stops a used IP from ever coming
+    back into circulation via a later scrape."""
+    existing_rows = await db.execute(select(Proxy.host, Proxy.port))
+    known: set[tuple[str, int]] = {(host, port) for host, port in existing_rows.all()}
+
     imported = 0
     skipped = 0
-    
+    now = datetime.now(timezone.utc)
     for proxy_data in proxy_data_list:
         try:
-            # Check if proxy already exists
-            existing = await db.execute(
-                select(Proxy).where(
-                    (Proxy.host == proxy_data['host']) & 
-                    (Proxy.port == proxy_data['port'])
-                )
-            )
-            if existing.scalar_one_or_none():
+            key = (proxy_data['host'], proxy_data['port'])
+            if key in known:
                 skipped += 1
                 continue
-            
-            # Create new proxy
-            proxy = Proxy(
+            known.add(key)
+            db.add(Proxy(
                 host=proxy_data['host'],
                 port=proxy_data['port'],
                 protocol=proxy_data['protocol'],
@@ -290,33 +426,70 @@ async def import_proxies_from_free_list(db: AsyncSession) -> dict:
                 country=proxy_data['country'],
                 provider=proxy_data['provider'],
                 is_healthy=True,
-                last_checked=datetime.now(timezone.utc)
-            )
-            db.add(proxy)
+                last_checked=now,
+            ))
             imported += 1
         except Exception as e:
             print(f"Error importing proxy {proxy_data}: {e}")
             skipped += 1
             continue
-    
+    return imported, skipped
+
+
+async def replace_free_proxy_pool(db: AsyncSession) -> dict:
+    """Swaps the free part of the proxy pool for a freshly scraped one - what
+    the proxy refresher worker (app.workers.proxy_refresher) runs every two
+    minutes so the list on the Proxies page is never stale.
+
+    "Free part" means unreserved AND never used: rows with an assigned_bot_id
+    belong to an in-flight pipeline (or a bot) and rows with consumed_at are
+    permanently retired, so both survive the swap untouched. Dropping the rest
+    is the point - a free proxy's is_healthy/last_checked is worthless a few
+    minutes later, and keeping dead entries around just makes every later
+    search test them again.
+
+    Scrapes first, then deletes and re-inserts inside one transaction: the
+    scheduler's slots are searching this same pool concurrently, so deleting
+    up front would leave them looking at an empty table for the several
+    seconds the scrape takes. If both sources come back empty the existing
+    list is deliberately left alone rather than replaced with nothing."""
+    scraped = await fetch_all_free_proxies()
+    if not scraped:
+        return {
+            'removed': 0, 'imported': 0, 'skipped': 0,
+            'error': 'Failed to fetch proxies from any configured source (free-proxy-list.net, proxyscrape.com) - keeping the current list',
+        }
+
     try:
+        deleted = await db.execute(
+            sa_delete(Proxy).where(Proxy.assigned_bot_id.is_(None), Proxy.consumed_at.is_(None))
+        )
+        removed = deleted.rowcount or 0
+        imported, skipped = await _insert_new_proxies(db, scraped)
         await db.commit()
     except Exception as e:
         await db.rollback()
-        return {'imported': imported, 'skipped': skipped, 'error': str(e)}
-    
-    return {'imported': imported, 'skipped': skipped, 'message': f'Successfully imported {imported} proxies'}
+        return {'removed': 0, 'imported': 0, 'skipped': 0, 'error': str(e)}
+
+    return {'removed': removed, 'imported': imported, 'skipped': skipped}
 
 
 async def cleanup_unhealthy_proxies(db: AsyncSession) -> dict:
     """
     Remove unhealthy proxies that are not assigned to any bot.
     Returns count of deleted proxies.
+
+    Retired proxies (consumed_at set - used by a pipeline, or retired after
+    failing in real use) are never deleted, even though they're unhealthy: their
+    rows exist precisely so the host:port dedup in _insert_new_proxies keeps
+    recognising them, and deleting one would let the very next scrape re-import
+    the same dead or already-used address and hand it to another run.
     """
     result = await db.execute(
         select(Proxy).where(
             (Proxy.is_healthy == False) &
-            (Proxy.assigned_bot_id.is_(None))
+            (Proxy.assigned_bot_id.is_(None)) &
+            (Proxy.consumed_at.is_(None))
         )
     )
     unhealthy = result.scalars().all()

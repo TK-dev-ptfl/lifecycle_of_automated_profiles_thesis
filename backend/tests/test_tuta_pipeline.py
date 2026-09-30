@@ -7,12 +7,80 @@ from playwright.async_api import async_playwright
 from app.pipelines.email_pool.providers import tuta
 from app.pipelines.email_pool.providers.tuta import (
     IP_BLOCKED_TEXT,
+    USERNAME_MAX_LENGTH,
+    USERNAME_MIN_LENGTH,
     TutaSignupContext,
     _raise_if_ip_blocked,
+    generate_username,
+    generate_username_from_identity,
     step_accept_agreements,
     step_captcha_sleep,
     step_check_recovery_kit_box,
 )
+
+# --- Generated address length -------------------------------------------------
+#
+# Tuta refuses an address that already exists, and short name-shaped local parts
+# ("alexsmith", "jordan42") are long since taken on a mail host that old - being
+# rejected as unavailable was the main way step_fill_credentials used to burn
+# through all MAX_USERNAME_ATTEMPTS.
+
+NAME_SAMPLES = [
+    ("Alex Smith", 28),
+    ("Jordan Miller", 34),
+    ("Zuzana Kováčová", 41),   # diacritics must be stripped, not dropped whole
+    ("Li Wei", None),           # no age: the tail comes from a plain number
+    ("Mária", 25),              # single name, no surname to build on
+    ("!!!", 33),                # nothing usable at all -> falls back
+]
+
+
+@pytest.mark.parametrize("display_name,age", NAME_SAMPLES)
+def test_generated_addresses_are_always_long_enough_to_be_free(display_name, age):
+    for _ in range(200):
+        username = generate_username_from_identity(display_name, age)
+        assert USERNAME_MIN_LENGTH <= len(username) <= USERNAME_MAX_LENGTH, username
+
+
+def test_no_name_fallback_is_also_long_and_not_obviously_generated():
+    for _ in range(200):
+        username = generate_username()
+        assert USERNAME_MIN_LENGTH <= len(username) <= USERNAME_MAX_LENGTH, username
+        # The old fallback was "bot" + hex, which is both short enough to
+        # collide and exactly the signal thesis 2.2.3 flags.
+        assert not username.startswith("bot")
+
+
+@pytest.mark.parametrize("display_name,age", NAME_SAMPLES)
+def test_generated_addresses_are_valid_local_parts(display_name, age):
+    """Only characters Tuta's username field accepts, and no leading/trailing
+    separator - "alexsmith." would be rejected outright, which is the one
+    rejection retrying cannot fix."""
+    for _ in range(200):
+        username = generate_username_from_identity(display_name, age)
+        assert all(c.isalnum() or c in "._" for c in username), username
+        assert not username.startswith((".", "_")) and not username.endswith((".", "_")), username
+        assert username == username.lower(), username
+
+
+def test_generated_addresses_always_carry_a_numeric_tail():
+    """The old generator had a branch that appended no number at all, which
+    produced precisely the plain, already-taken addresses this is meant to
+    avoid. The tail is also where most of the entropy lives, so it must never be
+    the part that gets trimmed to fit the length cap."""
+    for _ in range(300):
+        username = generate_username_from_identity("Alex Smith", 28)
+        assert username[-1].isdigit(), username
+
+
+def test_generated_addresses_do_not_repeat_for_one_identity():
+    """Two identities can share a display name and age; their addresses must
+    still differ, or the second run fails on an address the first one took."""
+    generated = {generate_username_from_identity("Alex Smith", 28) for _ in range(2000)}
+    # Comfortably unique - a handful of repeats in 2000 draws from one single
+    # name would still be fine (step_fill_credentials retries on rejection), but
+    # anything near the old generator's rate would not.
+    assert len(generated) > 1950, f"only {len(generated)} distinct addresses in 2000 draws"
 
 # step_manual_captcha is disabled for now (see tuta.py - swapped out for
 # step_captcha_sleep in PIPELINE_STEPS), so it's no longer importable. The

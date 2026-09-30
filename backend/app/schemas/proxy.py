@@ -34,6 +34,11 @@ class ProxyResponse(ProxyBase):
     id: UUID
     assigned_bot_id: Optional[UUID]
     is_healthy: bool
+    # Set once this proxy has been handed to a pipeline, or retired after
+    # failing in real use - permanent, and what excludes it from every
+    # candidate search. Exposed so the Proxies page can tell "free" from
+    # "reserved" from "retired" rather than showing all three as "assigned".
+    consumed_at: Optional[datetime] = None
     last_checked: datetime
     created_at: datetime
 

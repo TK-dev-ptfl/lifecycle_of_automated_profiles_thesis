@@ -26,7 +26,9 @@ export interface PipelineStatus {
   // whose it was both stay visible on the Pipelines/Monitoring pages either way.
   display_name: string | null
   provider: string
-  status: 'running' | 'waiting_manual' | 'completed' | 'failed'
+  // 'queued' = created and handed to the pipeline scheduler, waiting for one
+  // of its slots. Everything else is a run that has actually started.
+  status: 'queued' | 'running' | 'waiting_manual' | 'completed' | 'failed'
   step_index: number
   step_name: string | null
   manual: boolean
@@ -75,3 +77,27 @@ export const getIdentity = async (id: string) => {
 }
 
 export const deleteIdentity = async (id: string) => api.delete(`/api/identities/${id}`)
+
+// What the backend's pipeline scheduler is doing with the identities it's been
+// handed. Creating an identity that needs a mailbox queues it there; the
+// scheduler assigns it a proxy and runs at most `concurrency` pipelines at once.
+export interface PipelineQueueStatus {
+  running: boolean
+  queued: number
+  active_slots: number
+  concurrency: number
+  // True when the scheduler also generates its own identities to keep every
+  // slot busy, rather than only running what it's given.
+  continuous: boolean
+  launched: number
+}
+
+export const getPipelineQueue = async () => {
+  const { data } = await api.get<PipelineQueueStatus>('/api/identities/pipeline-queue')
+  return data
+}
+
+export const clearPipelineQueue = async () => {
+  const { data } = await api.delete<{ dropped: number }>('/api/identities/pipeline-queue')
+  return data
+}
