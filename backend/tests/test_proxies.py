@@ -385,6 +385,7 @@ def test_webshare_fetcher_parses_credentials_and_skips_invalid_entries():
     assert result == [{
         "host": "45.1.2.3", "port": 5555, "username": "u1", "password": "p1",
         "protocol": "http", "type": "residential", "country": "DE", "provider": "webshare",
+        "is_rotating": False,
     }]
 
 
@@ -442,6 +443,7 @@ def test_webshare_returns_the_rotating_endpoint_without_an_api_key():
     """The two Webshare modes are independent - proxy credentials alone are
     enough, no API key needed."""
     with patch("app.services.proxy_service.settings.WEBSHARE_API_KEY", ""), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_HOST", "p.webshare.io"), \
          patch("app.services.proxy_service.settings.WEBSHARE_PROXY_USERNAME", "u"), \
          patch("app.services.proxy_service.settings.WEBSHARE_PROXY_PASSWORD", "p"):
         rows = proxy_service.fetch_proxies_from_webshare()
@@ -453,6 +455,7 @@ def test_webshare_returns_the_rotating_endpoint_without_an_api_key():
 def test_a_failing_api_key_still_leaves_the_rotating_endpoint():
     """An expired API key must not take the rest of Webshare down with it."""
     with patch("app.services.proxy_service.settings.WEBSHARE_API_KEY", "expired"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_HOST", "p.webshare.io"), \
          patch("app.services.proxy_service.settings.WEBSHARE_PROXY_USERNAME", "u"), \
          patch("app.services.proxy_service.settings.WEBSHARE_PROXY_PASSWORD", "p"), \
          patch("app.services.proxy_service.httpx.Client", side_effect=Exception("401")):
@@ -567,3 +570,109 @@ async def test_import_preserves_the_rotating_flag(db_session):
         select(Proxy).where(Proxy.host == "p.webshare.io")
     )).scalars().first()
     assert row is not None and row.is_rotating is True
+
+
+# --- Explicitly pasted Webshare list -----------------------------------------
+
+def test_webshare_list_parses_the_dashboard_download_format():
+    """Webshare's Dashboard -> Proxy -> List -> Download gives
+    "ip:port:username:password" per line. Pasting that verbatim has to work,
+    since enumerating an account otherwise needs an API key."""
+    raw = (
+        "31.59.20.176:6754:cfewspic:secret\n"
+        "45.38.107.97:6014:cfewspic:secret\n"
+    )
+    with patch("app.services.proxy_service.settings.WEBSHARE_PROXY_LIST", raw):
+        entries = proxy_service.parse_webshare_proxy_list(raw)
+
+    assert [(e["host"], e["port"], e["username"], e["password"]) for e in entries] == [
+        ("31.59.20.176", 6754, "cfewspic", "secret"),
+        ("45.38.107.97", 6014, "cfewspic", "secret"),
+    ]
+    # Fixed addresses, so each is used once and retired like any other proxy.
+    assert all(e["is_rotating"] is False for e in entries)
+    assert all(e["provider"] == "webshare" for e in entries)
+
+
+def test_webshare_list_accepts_bare_host_port_and_shared_credentials():
+    with patch("app.services.proxy_service.settings.WEBSHARE_PROXY_USERNAME", "shared-user"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_PASSWORD", "shared-pass"):
+        entries = proxy_service.parse_webshare_proxy_list("31.59.20.176:6754")
+
+    assert entries[0]["username"] == "shared-user"
+    assert entries[0]["password"] == "shared-pass"
+
+
+def test_webshare_list_tolerates_commas_comments_schemes_and_duplicates():
+    raw = (
+        "# my proxies\n"
+        "http://31.59.20.176:6754, 45.38.107.97:6014\n"
+        "\n"
+        "31.59.20.176:6754\n"          # duplicate of the first
+        "not-a-proxy\n"
+        "9.9.9.9:notaport\n"
+    )
+    entries = proxy_service.parse_webshare_proxy_list(raw)
+    assert [(e["host"], e["port"]) for e in entries] == [
+        ("31.59.20.176", 6754),
+        ("45.38.107.97", 6014),
+    ]
+
+
+def test_rotating_endpoint_needs_a_host_not_just_credentials():
+    """An empty host used to yield a bogus ":80" proxy that got imported and then
+    failed every health check - credentials alone are not an endpoint."""
+    with patch("app.services.proxy_service.settings.WEBSHARE_PROXY_HOST", ""), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_USERNAME", "u"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_PASSWORD", "p"):
+        assert proxy_service.webshare_rotating_endpoint() is None
+
+
+def test_every_webshare_entry_declares_is_rotating():
+    """Anything reading entry["is_rotating"] directly blew up on API entries,
+    which never set the key."""
+    page = {"next": None, "results": [
+        {"proxy_address": "45.1.2.3", "port": 5555, "username": "u", "password": "p",
+         "country_code": "de", "valid": True},
+    ]}
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json = MagicMock(return_value=page)
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value.get.return_value = fake_response
+
+    with patch("app.services.proxy_service.settings.WEBSHARE_API_KEY", "k"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_LIST", "31.59.20.176:6754"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_USERNAME", "u"), \
+         patch("app.services.proxy_service.settings.WEBSHARE_PROXY_PASSWORD", "p"), \
+         patch("app.services.proxy_service.httpx.Client", return_value=fake_client):
+        rows = proxy_service.fetch_proxies_from_webshare()
+
+    assert rows, "expected the list entry and the API entry"
+    assert all("is_rotating" in r for r in rows)
+    # One row per address, even though both sources can name the same proxy.
+    assert len({(r["host"], r["port"]) for r in rows}) == len(rows)
+
+
+@pytest.mark.asyncio
+async def test_listed_webshare_proxies_are_offered_to_identities(db_session):
+    """End of the chain: a pasted proxy ends up as a residential candidate an
+    identity can be given, with its credentials intact."""
+    from app.services import identity_service
+
+    await _all_providers_on(db_session)
+    entries = [{
+        "host": "31.59.20.176", "port": 6754, "username": "u", "password": "p",
+        "protocol": "http", "type": "residential", "country": "GB",
+        "provider": "webshare", "is_rotating": False,
+    }]
+    with patch("app.services.proxy_service.fetch_all_free_proxies", return_value=entries):
+        result = await proxy_service.import_proxies_from_free_list(db_session)
+    assert result.get("error") is None
+
+    candidate = next(
+        c for c in await identity_service.list_free_proxy_candidates(db_session)
+        if c.host == "31.59.20.176"
+    )
+    # Credentials have to survive all the way here, or Playwright gets a 407.
+    assert candidate.username == "u" and candidate.password == "p"

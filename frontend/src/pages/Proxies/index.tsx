@@ -181,9 +181,18 @@ export default function ProxiesPage() {
   })
   const fetchFree = useMutation({ 
     mutationFn: fetchProxiesFromFreeList, 
-    onSuccess: () => { 
+    // Pulls from every ENABLED provider - naming two of them was wrong as soon
+    // as Webshare existed, and it said nothing about what actually came back.
+    onSuccess: (result: { imported?: number; skipped?: number; error?: string }) => {
       inv()
-      alert('Successfully fetched and imported proxies from free-proxy-list.net and proxyscrape.com!')
+      if (result?.error) {
+        alert('Proxy fetch failed: ' + result.error)
+        return
+      }
+      alert(
+        'Fetched from all enabled providers: ' + (result?.imported ?? 0) + ' new, ' +
+        (result?.skipped ?? 0) + ' already known or already used.'
+      )
     },
     onError: (error: any) => {
       alert(`Error fetching proxies: ${error.message}`)

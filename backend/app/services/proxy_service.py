@@ -187,7 +187,11 @@ def webshare_rotating_endpoint() -> Optional[dict]:
     after one signup: see the Proxy model, and
     identity_service._claim_and_consume_free_proxy.
     """
-    if not (settings.WEBSHARE_PROXY_USERNAME and settings.WEBSHARE_PROXY_PASSWORD):
+    if not (
+        settings.WEBSHARE_PROXY_HOST
+        and settings.WEBSHARE_PROXY_USERNAME
+        and settings.WEBSHARE_PROXY_PASSWORD
+    ):
         return None
     return {
         "host": settings.WEBSHARE_PROXY_HOST,
@@ -201,6 +205,82 @@ def webshare_rotating_endpoint() -> Optional[dict]:
         "provider": "webshare",
         "is_rotating": True,
     }
+
+
+def parse_webshare_proxy_list(raw: str) -> list[dict]:
+    """Parses a pasted Webshare proxy list into proxy entries.
+
+    Accepts Webshare's own download format, "ip:port:username:password" per
+    line, and the shorter "ip:port" (which uses WEBSHARE_PROXY_USERNAME /
+    WEBSHARE_PROXY_PASSWORD instead). Separated by newlines or commas, blank
+    entries and "#" comments ignored.
+
+    This exists because enumerating an account's proxies otherwise needs an API
+    key, and a plan can have neither an API key nor backbone access while still
+    having perfectly good direct proxies. These are fixed IPs, so they are NOT
+    rotating - each is used by one identity and retired like any other proxy.
+    """
+    entries: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+
+    for chunk in raw.replace(",", "\n").splitlines():
+        line = chunk.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Tolerate a scheme if someone pasted a full URL.
+        if "://" in line:
+            line = line.split("://", 1)[1]
+        parts = line.split(":")
+        if len(parts) == 2:
+            host, port_str = parts
+            username = settings.WEBSHARE_PROXY_USERNAME or None
+            password = settings.WEBSHARE_PROXY_PASSWORD or None
+        elif len(parts) == 4:
+            host, port_str, username, password = parts
+        else:
+            print(f"Webshare list: skipping unparseable entry {line!r}")
+            continue
+
+        host = host.strip()
+        if not host or not port_str.strip().isdigit():
+            print(f"Webshare list: skipping unparseable entry {line!r}")
+            continue
+        port = int(port_str)
+
+        if (host, port) in seen:
+            continue
+        seen.add((host, port))
+
+        entries.append({
+            "host": host,
+            "port": port,
+            "username": (username or None) and username.strip(),
+            "password": (password or None) and password.strip(),
+            "protocol": "http",
+            "type": "residential",
+            "country": "UN",
+            "provider": "webshare",
+            "is_rotating": False,
+        })
+
+    return entries
+
+
+def verify_webshare_proxy(entry: dict) -> Optional[str]:
+    """Calls Webshare's IP echo through one proxy entry and returns the exit IP
+    it reported, or None if the proxy didn't work. Diagnostic only."""
+    auth = ""
+    if entry.get("username"):
+        auth = f"{entry['username']}:{entry.get('password') or ''}@"
+    proxy_url = f"http://{auth}{entry['host']}:{entry['port']}/"
+    try:
+        with httpx.Client(proxy=proxy_url, timeout=20.0, follow_redirects=True) as client:
+            response = client.get(settings.WEBSHARE_ECHO_URL)
+            response.raise_for_status()
+            return response.text.strip()
+    except Exception as e:
+        print(f"Webshare proxy {entry['host']}:{entry['port']} check failed: {e}")
+        return None
 
 
 def verify_webshare_rotating_endpoint() -> Optional[str]:
@@ -231,7 +311,9 @@ def fetch_proxies_from_webshare() -> list[dict]:
     - The rotating endpoint (proxy username/password, no API key): one entry,
       flagged is_rotating, reusable across identities because each connection
       exits from a different IP.
-    - The API list (API key): the account's individual fixed-IP proxies.
+    - An explicitly pasted list (WEBSHARE_PROXY_LIST): the account's fixed-IP
+      proxies, for a plan with neither an API key nor backbone access.
+    - The API list (API key): the same fixed-IP proxies, fetched automatically.
 
     Webshare is the only source that returns credentials at all, which is why
     check_proxy_health and _proxy_to_playwright_config both had to learn to pass
@@ -249,12 +331,18 @@ def fetch_proxies_from_webshare() -> list[dict]:
     if rotating is not None:
         proxies.append(rotating)
 
+    listed = parse_webshare_proxy_list(settings.WEBSHARE_PROXY_LIST)
+    if listed:
+        print(f"Webshare: {len(listed)} proxies from WEBSHARE_PROXY_LIST")
+        proxies.extend(listed)
+
     if not settings.WEBSHARE_API_KEY:
         if not proxies:
             print(
-                "Webshare: nothing configured, skipping. Set WEBSHARE_PROXY_USERNAME/"
-                "WEBSHARE_PROXY_PASSWORD for the rotating endpoint, or WEBSHARE_API_KEY "
-                "to list individual proxies (backend/.env)."
+                "Webshare: nothing configured, skipping. Set WEBSHARE_PROXY_LIST to the list "
+                "from Dashboard -> Proxy -> List -> Download, or WEBSHARE_API_KEY to fetch it "
+                "automatically, or WEBSHARE_PROXY_USERNAME/WEBSHARE_PROXY_PASSWORD for the "
+                "rotating endpoint (backend/.env)."
             )
         return proxies
 
@@ -292,12 +380,27 @@ def fetch_proxies_from_webshare() -> list[dict]:
                         "type": "residential",
                         "country": (entry.get("country_code") or "UN").upper(),
                         "provider": "webshare",
+                        # Each of these is a fixed address, unlike the backbone
+                        # endpoint - set explicitly so every entry this module
+                        # produces has the key.
+                        "is_rotating": False,
                     })
 
                 if not payload.get("next"):
                     break
 
-        return proxies
+        # The API can return proxies already supplied via WEBSHARE_PROXY_LIST;
+        # keep one entry per address so the import's own dedup isn't relied on
+        # to paper over it.
+        deduped: list[dict] = []
+        seen: set[tuple[str, int]] = set()
+        for entry in proxies:
+            key = (entry["host"], entry["port"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(entry)
+        return deduped
 
     except Exception as e:
         # Keep whatever the rotating endpoint contributed - an expired API key

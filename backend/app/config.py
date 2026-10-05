@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     WEBSHARE_PROXY_PORT: int = 80
     WEBSHARE_PROXY_USERNAME: str = ""
     WEBSHARE_PROXY_PASSWORD: str = ""
+    # 3. An explicit list of the account's proxies, for a plan that has no API
+    #    key and no backbone access. Paste exactly what Webshare's
+    #    Dashboard -> Proxy -> List -> Download gives you, which is one
+    #    "ip:port:username:password" per line; "ip:port" alone also works and
+    #    falls back to WEBSHARE_PROXY_USERNAME/PASSWORD. Newlines or commas.
+    WEBSHARE_PROXY_LIST: str = ""
     # Webshare's own IP echo service. Used to verify the rotating endpoint and
     # report which exit IP it handed out, which is also the cheapest proof that
     # it really is rotating.

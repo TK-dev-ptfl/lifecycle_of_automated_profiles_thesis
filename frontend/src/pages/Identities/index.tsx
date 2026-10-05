@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { getProxies } from '../../api/proxies'
+import { getProxies, fetchProxiesFromFreeList } from '../../api/proxies'
 import { getEmails, getEmailPlatforms, updateEmail } from '../../api/emails'
 import { createIdentity, deleteIdentity as deleteIdentityApi, getIdentities, getPipelineQueue } from '../../api/identities'
 import { Modal }  from '../../components/ui/Modal'
@@ -804,10 +804,26 @@ export default function IdentitiesPage() {
     count: number,
     onItemUpdate: (index: number, status: 'running' | 'done' | 'error', message: string) => void,
   ) {
+    // Pull a fresh list from every enabled provider before creating anything, so
+    // the identities queued below are matched against a current pool rather than
+    // whatever the refresher happened to leave behind up to two minutes ago.
+    // Worth the few seconds: a paid provider's proxies are the ones that
+    // actually complete a signup, and they are only in the pool once fetched.
+    for (let i = 0; i < count; i++) onItemUpdate(i, 'running', 'Fetching fresh proxies…')
+    try {
+      console.info('Proxy fetch before generating:', await fetchProxiesFromFreeList())
+    } catch (err) {
+      // Not fatal - the existing pool may well be fine, and the refresher worker
+      // keeps pulling on its own schedule regardless.
+      console.error('Proxy fetch failed, continuing with the existing pool', err)
+    }
+    await qc.invalidateQueries({ queryKey: ['proxies'] })
+
     // Only used to flavour the generated persona (name, timezone, language) -
     // the real proxy is chosen backend-side and needn't match. See
     // pickIdentityCountry.
-    const poolForCountryFlavour = proxies.filter(p => !p.assigned_bot_id && !usedProxyIds.includes(p.id))
+    const { data: freshProxies = [] } = await refetchProxies()
+    const poolForCountryFlavour = freshProxies.filter(p => !p.assigned_bot_id && !usedProxyIds.includes(p.id))
 
     async function queueOne(index: number) {
       onItemUpdate(index, 'running', 'Creating identity…')

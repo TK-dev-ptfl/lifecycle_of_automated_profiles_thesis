@@ -66,8 +66,10 @@ def no_real_webshare_credentials(monkeypatch):
 
     for name in (
         "WEBSHARE_API_KEY",
+        "WEBSHARE_PROXY_HOST",
         "WEBSHARE_PROXY_USERNAME",
         "WEBSHARE_PROXY_PASSWORD",
+        "WEBSHARE_PROXY_LIST",
     ):
         monkeypatch.setattr(proxy_service.settings, name, "")
 
