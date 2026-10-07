@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hearth</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#F1F0F6; --surface:#FFFFFF; --raise:#F7F6FB; --ink:#1D1B2B; --muted:#6A6782; --line:#E2E0EC;
+  --accent:#5B3FD9; --accent-ink:#FFFFFF; --like:#D9245A; --ok:#22845A; --warn:#A06210; --bad:#C2302B;
+  --display:"Bricolage Grotesque","Avenir Next","Segoe UI",system-ui,sans-serif;
+  --body:"Figtree","Segoe UI",system-ui,-apple-system,sans-serif;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#121119; --surface:#1B1A25; --raise:#22212E; --ink:#ECEAF5; --muted:#A09DB8; --line:#2E2C3D;
+    --accent:#9B87FF; --accent-ink:#14121F; --like:#FF6B94; --ok:#5CC491; --warn:#E5AA55; --bad:#FF7A70;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#121119; --surface:#1B1A25; --raise:#22212E; --ink:#ECEAF5; --muted:#A09DB8; --line:#2E2C3D;
+  --accent:#9B87FF; --accent-ink:#14121F; --like:#FF6B94; --ok:#5CC491; --warn:#E5AA55; --bad:#FF7A70;
+}
+html{scroll-padding-top:calc(env(safe-area-inset-top,0px) + 64px)}
+*,*::before,*::after{box-sizing:inherit}
+body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 var(--body);-webkit-font-smoothing:antialiased}
+button,input,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.grecaptcha-badge{visibility:hidden}
+
+/* Top bar */
+.bar{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:color-mix(in srgb,var(--paper) 88%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.bar-in{max-width:1240px;margin:0 auto;height:60px;display:flex;align-items:center;gap:20px;padding:0 20px}
+.brand{font:800 1.6rem/1 var(--display);letter-spacing:-.03em;display:flex;align-items:center;gap:8px}
+.brand svg{width:26px;height:26px;color:var(--accent)}
+.search{flex:1;max-width:420px;margin-left:auto;background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:9px 16px}
+.me{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font-weight:700;background:var(--accent);color:var(--accent-ink);border:none}
+
+/* Layout */
+.layout{max-width:1240px;margin:0 auto;display:grid;grid-template-columns:220px minmax(0,600px) minmax(0,300px);gap:32px;padding:24px 20px 120px;justify-content:center}
+.nav{position:sticky;top:84px;align-self:start;display:flex;flex-direction:column;gap:2px}
+.nav button{display:flex;align-items:center;gap:14px;padding:10px 14px;border:none;background:none;border-radius:12px;font-weight:600;font-size:1.02rem;text-align:left}
+.nav button:hover{background:var(--surface)}
+.nav button[aria-current]{background:var(--surface);color:var(--accent)}
+.nav svg{width:22px;height:22px}
+.side{position:sticky;top:84px;align-self:start;display:flex;flex-direction:column;gap:20px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:18px}
+.card h2{font:700 1.15rem/1.2 var(--display);margin:0 0 12px}
+.trend{display:block;width:100%;text-align:left;border:none;background:none;padding:8px 0;border-top:1px solid var(--line)}
+.trend:first-of-type{border-top:none}
+.trend b{display:block}
+.trend span{color:var(--muted);font-size:.85rem}
+.who{display:flex;align-items:center;gap:10px;padding:8px 0}
+.who div{flex:1;min-width:0}
+.who b,.who span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.who span{color:var(--muted);font-size:.85rem}
+
+/* Composer & posts */
+.composer{display:flex;gap:12px}
+.composer textarea{flex:1;min-height:56px;resize:vertical;border:none;background:transparent;font-size:1.05rem;padding:8px 0}
+.composer textarea:focus-visible{outline:none}
+.composer-foot{display:flex;justify-content:flex-end;border-top:1px solid var(--line);padding-top:12px;margin-top:8px}
+.pill{border:none;border-radius:999px;padding:8px 18px;font-weight:700;background:var(--accent);color:var(--accent-ink)}
+.pill.quiet{background:transparent;color:var(--ink);border:1.5px solid var(--line)}
+.pill[aria-pressed="true"]{background:transparent;color:var(--ink);border:1.5px solid var(--line)}
+.feed{display:flex;flex-direction:column;gap:14px;margin-top:14px}
+.post{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:16px 18px 8px}
+.post.new{animation:pop .35s ease-out}
+@keyframes pop{from{transform:translateY(-6px);opacity:0}}
+.ph{display:flex;align-items:center;gap:10px}
+.av{flex:none;width:42px;height:42px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:.95rem;color:#fff;background:hsl(var(--h) 55% 48%)}
+.ph .who-line{flex:1;min-width:0;line-height:1.25}
+.ph .who-line b{font-weight:700}
+.ph .who-line span{color:var(--muted);font-size:.9rem;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.icon{border:none;background:none;width:34px;height:34px;border-radius:50%;display:grid;place-items:center;color:var(--muted)}
+.icon:hover{background:var(--raise);color:var(--ink)}
+.icon svg{width:20px;height:20px}
+.post .text{margin:10px 0 12px;font-size:1.02rem;white-space:pre-wrap;overflow-wrap:anywhere}
+.media{aspect-ratio:16/10;border-radius:14px;margin-bottom:10px;border:1px solid var(--line)}
+.acts{display:flex;justify-content:space-between;max-width:440px;margin-left:-8px}
+.act{display:flex;align-items:center;gap:6px;border:none;background:none;color:var(--muted);padding:8px;border-radius:999px;font-size:.9rem;font-variant-numeric:tabular-nums}
+.act svg{width:19px;height:19px}
+.act:hover{background:var(--raise);color:var(--ink)}
+.act.like[aria-pressed="true"]{color:var(--like)}
+.act.like[aria-pressed="true"] svg path{fill:currentColor}
+.act.rep[aria-pressed="true"]{color:var(--ok)}
+.act.save[aria-pressed="true"]{color:var(--accent)}
+.act.save[aria-pressed="true"] svg path{fill:currentColor}
+.comments{border-top:1px solid var(--line);margin-top:6px;padding:10px 0 8px}
+.cmt{display:flex;gap:10px;padding:6px 0}
+.cmt .av{width:30px;height:30px;font-size:.75rem}
+.cmt div{background:var(--raise);border-radius:14px;padding:6px 12px;min-width:0}
+.cmt b{font-size:.88rem}
+.cmt p{margin:0;font-size:.95rem;overflow-wrap:anywhere}
+.reply{display:flex;gap:8px;margin-top:8px}
+.reply input{flex:1;min-width:0;border:1px solid var(--line);background:var(--raise);border-radius:999px;padding:8px 14px}
+.loading{text-align:center;color:var(--muted);padding:24px}
+.toast{position:fixed;left:50%;bottom:calc(24px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--paper);padding:10px 18px;border-radius:999px;font-weight:600;z-index:60;opacity:0;pointer-events:none;transition:opacity .2s}
+.toast.show{opacity:1}
+
+/* Session check widget */
+.sc{position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:50;width:320px;max-width:calc(100vw - 32px);
+  background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:0 12px 40px -12px rgba(20,16,50,.35);font-size:.88rem}
+.sc-head{display:flex;align-items:center;gap:10px;padding:12px 14px}
+.sc-title{flex:1;font:700 1rem/1.2 var(--display)}
+.sc-title span{display:block;font:500 .8rem/1.3 var(--body);color:var(--muted)}
+.sc-num{font:800 2rem/1 var(--display);font-variant-numeric:tabular-nums;min-width:2ch;text-align:right}
+.sc-body{padding:0 14px 12px;max-height:min(62vh,560px);overflow:auto;overscroll-behavior:contain}
+.sc.min .sc-body{display:none}
+.sc canvas{display:block;width:100%;height:34px;border-radius:8px;background:var(--raise);margin-bottom:10px}
+.row{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:7px 0;border-top:1px solid var(--line)}
+.row b{font-weight:600}
+.row .v{font-weight:700;font-variant-numeric:tabular-nums;text-align:right}
+.row .sub{grid-column:1 / 3;color:var(--muted);font-size:.8rem}
+.meter{grid-column:1 / 3;height:5px;border-radius:3px;background:var(--raise);overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:currentColor;transition:width .4s}
+.tone-ok{color:var(--ok)} .tone-warn{color:var(--warn)} .tone-bad{color:var(--bad)} .tone-none{color:var(--muted)}
+.sc-tools{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 8px}
+.sc-tools button{border:1px solid var(--line);background:var(--raise);border-radius:999px;padding:5px 10px;font-weight:600;font-size:.8rem}
+.sc-tools button[aria-pressed="true"]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.checks{list-style:none;margin:0;padding:0}
+.chk{display:grid;grid-template-columns:8px 1fr auto;gap:2px 8px;padding:6px 0;border-top:1px solid var(--line)}
+.chk .m{width:8px;height:8px;border-radius:50%;margin-top:6px;background:var(--line)}
+.chk .s{font-size:.75rem;font-weight:700;color:var(--muted)}
+.chk p{grid-column:2 / 4;margin:0;color:var(--muted);font-size:.78rem;overflow-wrap:anywhere}
+.chk[data-s="pass"] .m{background:var(--ok)} .chk[data-s="pass"] .s{color:var(--ok)}
+.chk[data-s="warn"] .m{background:var(--warn)} .chk[data-s="warn"] .s{color:var(--warn)}
+.chk[data-s="fail"] .m{background:var(--bad)} .chk[data-s="fail"] .s{color:var(--bad)}
+.legal{color:var(--muted);font-size:.72rem;margin:10px 0 0}
+.legal a{color:inherit}
+
+@media (max-width:1180px){.layout{grid-template-columns:200px minmax(0,600px)}.side{display:none}}
+@media (max-width:820px){.layout{grid-template-columns:minmax(0,1fr);padding:16px 12px 140px}.nav{display:none}.search{display:none}.me{margin-left:auto}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="bar-in">
+    <div class="brand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3c2 3 5 5 5 9a5 5 0 0 1-10 0c0-2 1-3 2-4 0 2 1 3 2 3 0-3-1-5 1-8z"/></svg>Hearth</div>
+    <input class="search" type="search" placeholder="Search Hearth" aria-label="Search">
+    <button class="me" aria-label="Your profile">YO</button>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="nav" aria-label="Main">
+    <button aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z"/></svg>Home</button>
+    <button><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>Explore</button>
+    <button><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 8 3 8H3s3-1 3-8M10 20a2 2 0 0 0 4 0"/></svg>Notifications</button>
+    <button><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 5h16v11H8l-4 4z"/></svg>Messages</button>
+    <button><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M6 3h12v18l-6-4-6 4z"/></svg>Saved</button>
+    <button><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4-6 8-6s7 2 8 6"/></svg>Profile</button>
+  </nav>
+
+  <main>
+    <section class="card" aria-label="New post">
+      <div class="composer">
+        <div class="av" style="--h:255">YO</div>
+        <textarea id="composer" placeholder="What's warming you up today?" aria-label="Write a post"></textarea>
+      </div>
+      <div class="composer-foot"><button class="pill" id="postBtn">Post</button></div>
+    </section>
+    <div class="feed" id="feed" aria-live="off"></div>
+    <div class="loading" id="sentinel">Loading more posts…</div>
+  </main>
+
+  <aside class="side">
+    <section class="card"><h2>Trending</h2><div id="trends"></div></section>
+    <section class="card"><h2>Who to follow</h2><div id="whoList"></div></section>
+  </aside>
+</div>
+
+<div class="toast" id="toast" role="status"></div>
+
+<aside class="sc" id="sc" aria-label="Session check">
+  <div class="sc-head">
+    <div class="sc-title">Session check<span id="scVerdict">Interact with the feed</span></div>
+    <div class="sc-num tone-none" id="scNum">–</div>
+    <button class="icon" id="scToggle" aria-expanded="true" aria-label="Collapse session check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg></button>
+  </div>
+  <div class="sc-body">
+    <canvas id="spark" aria-label="Cursor speed, last 6 seconds"></canvas>
+    <div class="row" id="rBeh"><b>Behaviour</b><span class="v">–</span><span class="meter"><i></i></span><span class="sub">Waiting for input</span></div>
+    <div class="row" id="rFp"><b>Fingerprint consistency</b><span class="v">…</span><span class="meter"><i></i></span><span class="sub">Running checks</span></div>
+    <div class="row" id="rRc"><b>reCAPTCHA v3</b><span class="v">–</span><span class="meter"><i></i></span><span class="sub">Starting</span></div>
+    <div class="sc-tools" role="group" aria-label="Details">
+      <button data-tab="beh" aria-pressed="false">Behaviour details</button>
+      <button data-tab="fp" aria-pressed="false">Fingerprint details</button>
+      <button id="rerun">Re-run services</button>
+      <button id="copyRep">Copy report</button>
+    </div>
+    <ul class="checks" id="detail" hidden></ul>
+    <p class="legal" id="legal" hidden>This site is protected by reCAPTCHA and the Google <a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Privacy Policy</a> and <a href="https://policies.google.com/terms" target="_blank" rel="noopener">Terms of Service</a> apply.</p>
+  </div>
+</aside>
+
+<script>
+(() => {
+'use strict';
+/* ===== Configuration: server.mjs fills these in; placeholders mean "not configured" ===== */
+const CFG = { recaptchaKey: '__RECAPTCHA_SITE_KEY__', verifyBase: '' };
+const configured = k => !!k && !k.startsWith('__');
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
+const sd = a => { const m = mean(a); return Math.sqrt(mean(a.map(x => (x - m) ** 2))); };
+const cv = a => a.length > 1 ? sd(a) / mean(a) : NaN;
+const med = a => { if (!a.length) return NaN; const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const f2 = n => Number.isFinite(n) ? n.toFixed(2) : '–';
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const rint = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+const LOADED = performance.now();
+
+/* ===== Dummy feed ===== */
+const FIRST = ['Maya','Tomás','Ines','Kofi','Lena','Arjun','Sofia','Noah','Yuki','Rita','Omar','Clara','Diego','Hana','Felix','Amara','Jonas','Leila','Marco','Priya','Elias','Zoe','Rui','Nadia'];
+const LAST = ['Ferreira','Okafor','Lindqvist','Tanaka','Moreau','Kaur','Silva','Novak','Haddad','Brennan','Costa','Ito','Mendes','Varga','Adeyemi','Rossi'];
+const POSTS = [
+  'Finally fixed the squeaky door hinge that has been haunting me since March. Small victories.',
+  'Hot take: the best part of any trip is the first coffee in a new city.',
+  'Planted tomatoes on the balcony. If anyone has tips for keeping pigeons away, I am listening.',
+  'Three hours debugging only to find a missing comma. Going for a walk now.',
+  'The bakery downstairs started doing cardamom buns and my budget is in trouble.',
+  'Reminder that you are allowed to leave a book unfinished. Life is short.',
+  'Ran my first 10k this morning. Slow, sweaty and very happy about it.',
+  'Is it just me or did this week last about a month?',
+  'New desk setup! Moved the monitor to eye level and my neck already thanks me.',
+  'Tried making ramen broth from scratch. Twelve hours later: worth it.',
+  'The sunset tonight looked like someone spilled orange juice across the river.',
+  'Learning to play the cello at 34. My neighbours are being very patient.',
+  'Anyone else keep a list of tiny things that made them happy each day? Mine today: a dog in a raincoat.',
+  'Spent the afternoon reorganising the bookshelf by colour. Cannot find anything now. Looks great.',
+  'Our team shipped the thing! Celebrating with questionable office pizza.',
+  'If you see someone struggling with a heavy suitcase on stairs, help them. Today it was me and a stranger saved my day.',
+  'Rainy Sunday, soup on the stove, nowhere to be. Perfect.',
+  'Took the long way home just to listen to the rest of the album.',
+  'Started journaling again. Day 4 and still going, which is a personal record.',
+  'The cat has decided my keyboard is the warmest place in the house. Productivity at zero.',
+  'Went to a tiny jazz bar last night and the trio played for two hours straight. Magic.',
+  'Question for the gardeners: is it too late to plant garlic?',
+  'Repainted the kitchen a soft green. It feels like a different flat.',
+  'Grandma sent her recipe for apple cake, written in pencil with three crossed-out versions. Treasure.',
+  'Commute podcast recommendations? I have run out of everything.',
+  'Five minutes of stretching every morning for a month. My back feels ten years younger.',
+  'Saw a heron fishing in the canal on the way to work. City wildlife never gets old.',
+  'Made a spreadsheet to plan a picnic. No regrets.'
+];
+const COMMENTS = ['So relatable', 'This made my day', 'Need the recipe!', 'Congrats!', 'Same here honestly', 'Love this',
+  'Ha, exactly', 'Where was this?', 'You inspired me to try it', 'Saving this for later', 'Ten out of ten', 'Big if true',
+  'Sending good vibes', 'Wait, really?', 'Tell me more', 'Absolutely beautiful'];
+const TRENDS = [['Morning runs', '4,210 posts'], ['Balcony gardens', '2,880 posts'], ['Ramen at home', '1,945 posts'], ['Rainy Sunday', '12.4K posts'], ['Jazz bars', '980 posts']];
+
+const ICON = {
+  like: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/></svg>',
+  cmt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 5h16v11H9l-5 4z"/></svg>',
+  rep: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l3 3-3 3M20 6H8a4 4 0 0 0-4 4v1M7 21l-3-3 3-3M4 18h12a4 4 0 0 0 4-4v-1"/></svg>',
+  save: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M6 3h12v18l-6-4-6 4z"/></svg>',
+  share: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3M7 8l5-5 5 5M5 13v7h14v-7"/></svg>',
+  more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>'
+};
+
+function person() {
+  const f = pick(FIRST), l = pick(LAST);
+  return { name: `${f} ${l}`, handle: (f + l.slice(0, 3) + rint(1, 99)).toLowerCase(), ini: f[0] + l[0], h: rint(0, 359) };
+}
+function media() {
+  const h = rint(0, 359), h2 = (h + rint(40, 140)) % 360;
+  return `radial-gradient(circle at ${rint(10, 90)}% ${rint(10, 90)}%, hsl(${h2} 80% 70% / .9), transparent 45%),` +
+    `radial-gradient(circle at ${rint(10, 90)}% ${rint(10, 90)}%, hsl(${(h2 + 60) % 360} 70% 60% / .8), transparent 40%),` +
+    `linear-gradient(${rint(0, 180)}deg, hsl(${h} 60% 45%), hsl(${h2} 55% 30%))`;
+}
+const fmt = n => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'K' : String(n);
+function commentHTML(p, text) {
+  return `<div class="cmt"><span class="av" style="--h:${p.h}">${esc(p.ini)}</span><div><b>${esc(p.name)}</b><p>${esc(text)}</p></div></div>`;
+}
+function postHTML(o = {}) {
+  const p = o.person || person();
+  const likes = o.likes ?? rint(0, 2400), cm = o.comments ?? rint(0, 6), reps = o.reps ?? rint(0, 300);
+  const ago = o.ago || pick(['2m', '9m', '24m', '1h', '3h', '5h', '8h', '1d']);
+  const cmts = Array.from({ length: Math.min(cm, 4) }, () => commentHTML(person(), pick(COMMENTS))).join('');
+  return `<article class="post${o.isNew ? ' new' : ''}" data-cmt="${cm}">
+    <div class="ph"><span class="av" style="--h:${p.h}">${esc(p.ini)}</span>
+      <div class="who-line"><b>${esc(p.name)}</b><span>@${esc(p.handle)} · ${ago}</span></div>
+      ${o.isNew ? '' : '<button class="pill quiet follow" aria-pressed="false">Follow</button>'}
+      <button class="icon more" aria-label="More options">${ICON.more}</button></div>
+    <p class="text">${esc(o.text || pick(POSTS))}</p>
+    ${!o.isNew && Math.random() < .4 ? `<div class="media" style="background:${media()}" role="img" aria-label="Photo"></div>` : ''}
+    <div class="acts">
+      <button class="act like" aria-pressed="false" data-n="${likes}" aria-label="Like">${ICON.like}<span>${fmt(likes)}</span></button>
+      <button class="act cmt-btn" aria-expanded="false" aria-label="Comments">${ICON.cmt}<span>${cm}</span></button>
+      <button class="act rep" aria-pressed="false" data-n="${reps}" aria-label="Repost">${ICON.rep}<span>${fmt(reps)}</span></button>
+      <button class="act save" aria-pressed="false" aria-label="Save">${ICON.save}</button>
+      <button class="act share" aria-label="Share">${ICON.share}</button>
+    </div>
+    <div class="comments" hidden>${cmts}<div class="reply"><input class="reply-in" placeholder="Write a comment" aria-label="Write a comment"><button class="pill send">Reply</button></div></div>
+  </article>`;
+}
+const feed = $('#feed');
+let postCount = 0;
+function addPosts(n) {
+  if (postCount >= 300) { $('#sentinel').textContent = "You're all caught up."; return; }
+  feed.insertAdjacentHTML('beforeend', Array.from({ length: n }, () => postHTML()).join(''));
+  postCount += n;
+}
+addPosts(8);
+new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) setTimeout(() => addPosts(6), 300 + Math.random() * 400); }, { rootMargin: '600px' }).observe($('#sentinel'));
+$('#trends').innerHTML = TRENDS.map(([t, n]) => `<button class="trend"><b>${t}</b><span>${n}</span></button>`).join('');
+$('#whoList').innerHTML = Array.from({ length: 3 }, () => { const p = person(); return `<div class="who"><span class="av" style="--h:${p.h}">${p.ini}</span><div><b>${p.name}</b><span>@${p.handle}</span></div><button class="pill quiet follow" aria-pressed="false">Follow</button></div>`; }).join('');
+
+let toastT;
+function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 1600); }
+
+function sendReply(post) {
+  const inp = post.querySelector('.reply-in'), v = inp.value.trim();
+  if (!v) return;
+  if (D.fieldInputs === 0) D.scriptSet = true;
+  inp.closest('.reply').insertAdjacentHTML('beforebegin', commentHTML({ name: 'You', ini: 'YO', h: 255 }, v));
+  inp.value = '';
+  const n = +post.dataset.cmt + 1; post.dataset.cmt = n; post.querySelector('.cmt-btn span').textContent = n;
+  service('comment');
+}
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  noteButtonClick(e, b);
+  const post = b.closest('.post');
+  if (b.classList.contains('like') || b.classList.contains('rep')) {
+    const on = b.getAttribute('aria-pressed') !== 'true';
+    b.setAttribute('aria-pressed', on); b.dataset.n = +b.dataset.n + (on ? 1 : -1);
+    b.querySelector('span').textContent = fmt(+b.dataset.n);
+    if (b.classList.contains('rep')) toast(on ? 'Reposted' : 'Repost removed');
+    service(b.classList.contains('like') ? 'like' : 'repost');
+  } else if (b.classList.contains('save')) {
+    const on = b.getAttribute('aria-pressed') !== 'true'; b.setAttribute('aria-pressed', on); toast(on ? 'Saved' : 'Removed from saved');
+  } else if (b.classList.contains('cmt-btn')) {
+    const c = post.querySelector('.comments'); c.hidden = !c.hidden; b.setAttribute('aria-expanded', !c.hidden);
+    if (!c.hidden) c.querySelector('.reply-in').focus({ preventScroll: true });
+  } else if (b.classList.contains('share')) toast('Link copied');
+  else if (b.classList.contains('more')) toast('Post menu is a placeholder');
+  else if (b.classList.contains('follow')) { const on = b.getAttribute('aria-pressed') !== 'true'; b.setAttribute('aria-pressed', on); b.textContent = on ? 'Following' : 'Follow'; service('follow'); }
+  else if (b.classList.contains('send')) sendReply(post);
+  else if (b.id === 'postBtn') {
+    const ta = $('#composer'), v = ta.value.trim(); if (!v) { ta.focus(); return; }
+    if (D.fieldInputs === 0) D.scriptSet = true;
+    feed.insertAdjacentHTML('afterbegin', postHTML({ text: v, isNew: true, person: { name: 'You', handle: 'you', ini: 'YO', h: 255 }, likes: 0, comments: 0, reps: 0, ago: 'now' }));
+    ta.value = ''; toast('Posted'); service('post');
+  } else if (b.closest('.nav') || b.classList.contains('trend') || b.classList.contains('me')) toast('This section is a placeholder');
+});
+document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.classList?.contains('reply-in')) sendReply(e.target.closest('.post')); });
+
+/* ===== Data collection ===== */
+const fresh = () => ({
+  moves: [], trace: [], trusted: 0, untrusted: 0, untrustedTypes: new Set(),
+  mouseMoves: 0, pointerMoves: 0, coalescedMulti: 0, coalescedMax: 0,
+  screenEq: 0, screenN: 0, movZero: 0, movN: 0,
+  mouseDowns: 0, teleports: 0, lastDown: null, dwell: [], pointerType: 'mouse', touch: false,
+  hoverEl: null, btnClicks: 0, unhovered: 0, aim: [],
+  wheels: [], scrolls: 0, scrollNoInput: 0, scrollPos: [], lastInput: -1e9, firstInput: null,
+  keyDown: new Map(), keyDwell: [], keyFlight: [], lastKeyT: null,
+  fieldKeys: 0, fieldChars: 0, fieldInputs: 0, pasted: false, scriptSet: false
+});
+let D = fresh();
+const opt = { capture: true, passive: true };
+const isField = t => t && t.matches && t.matches('textarea, input.reply-in');
+const trust = e => { if (e.isTrusted) D.trusted++; else { D.untrusted++; D.untrustedTypes.add(e.type); } if (D.firstInput == null) D.firstInput = e.timeStamp; };
+
+addEventListener('pointermove', e => {
+  D.pointerMoves++;
+  const n = e.getCoalescedEvents ? e.getCoalescedEvents().length : 1;
+  if (n > 1) D.coalescedMulti++;
+  D.coalescedMax = Math.max(D.coalescedMax, n);
+}, opt);
+addEventListener('pointerdown', e => { D.pointerType = e.pointerType || 'mouse'; if (e.pointerType === 'touch') D.touch = true; }, opt);
+addEventListener('mouseover', e => { D.hoverEl = e.target; }, opt);
+addEventListener('mousemove', e => {
+  trust(e); D.mouseMoves++;
+  const p = { t: e.timeStamp, x: e.clientX, y: e.clientY }, last = D.moves[D.moves.length - 1];
+  D.moves.push(p); if (D.moves.length > 8000) D.moves.splice(0, 1000);
+  D.screenN++; if (e.screenX === e.clientX && e.screenY === e.clientY) D.screenEq++;
+  if (last && (p.x !== last.x || p.y !== last.y)) {
+    D.movN++; if (e.movementX === 0 && e.movementY === 0) D.movZero++;
+    D.trace.push({ t: p.t, v: dist(p, last) / Math.max(p.t - last.t, 4) });
+  }
+  if (e.buttons) D.lastInput = e.timeStamp;
+}, opt);
+addEventListener('mousedown', e => {
+  trust(e); D.lastInput = e.timeStamp;
+  if (D.pointerType !== 'touch') {
+    D.mouseDowns++;
+    const last = D.moves[D.moves.length - 1];
+    if (!last || dist(last, { x: e.clientX, y: e.clientY }) > 6) D.teleports++;
+  }
+  D.lastDown = e.timeStamp;
+}, opt);
+addEventListener('mouseup', e => { trust(e); if (D.lastDown != null && D.pointerType !== 'touch') D.dwell.push(e.timeStamp - D.lastDown); D.lastDown = null; }, opt);
+addEventListener('click', trust, opt);
+addEventListener('wheel', e => { trust(e); D.lastInput = e.timeStamp; D.wheels.push({ t: e.timeStamp, dy: e.deltaY }); }, opt);
+addEventListener('keydown', e => {
+  trust(e); D.lastInput = e.timeStamp;
+  if (e.repeat) return;
+  D.keyDown.set(e.code || e.key, e.timeStamp);
+  if (isField(e.target)) {
+    if (D.lastKeyT != null) { const fl = e.timeStamp - D.lastKeyT; if (fl < 1500) D.keyFlight.push(fl); }
+    D.lastKeyT = e.timeStamp;
+    if (e.key && e.key.length === 1) D.fieldKeys++;
+  }
+}, opt);
+addEventListener('keyup', e => { trust(e); const k = e.code || e.key; if (D.keyDown.has(k)) { D.keyDwell.push(e.timeStamp - D.keyDown.get(k)); D.keyDown.delete(k); } }, opt);
+addEventListener('input', e => {
+  if (!isField(e.target)) return;
+  D.fieldInputs++;
+  if (e.inputType === 'insertFromPaste' || e.inputType === 'insertFromDrop') D.pasted = true;
+  else if (e.inputType && e.inputType.startsWith('insert') && e.data) D.fieldChars += e.data.length;
+}, opt);
+addEventListener('paste', () => { D.pasted = true; }, opt);
+['touchstart', 'touchmove', 'touchend'].forEach(t => addEventListener(t, e => { D.touch = true; D.lastInput = e.timeStamp; }, opt));
+let scrolledFar = 0;
+addEventListener('scroll', e => {
+  if (e.timeStamp - LOADED < 1500) return;
+  D.scrolls++;
+  if (e.timeStamp - D.lastInput > 1500) D.scrollNoInput++;
+  if (e.target === document) {
+    D.scrollPos.push({ t: e.timeStamp, y: scrollY });
+    if (D.scrollPos.length > 6000) D.scrollPos.splice(0, 1000);
+    if (scrollY - scrolledFar > 2500) { scrolledFar = scrollY; service('scroll'); }
+  }
+}, opt);
+
+function noteButtonClick(e, b) {
+  if (e.detail === 0 || D.pointerType === 'touch') return;
+  D.btnClicks++;
+  if (!(D.hoverEl && b.contains(D.hoverEl))) D.unhovered++;
+  const r = b.getBoundingClientRect();
+  const off = Math.hypot(e.clientX - (r.left + r.width / 2), e.clientY - (r.top + r.height / 2));
+  D.aim.push({ px: off, n: off / (Math.hypot(r.width, r.height) / 2) });
+}
+
+/* ===== Behaviour analysis ===== */
+function strokes() {
+  const S = []; let cur = [];
+  for (const p of D.moves) { const l = cur[cur.length - 1]; if (l && p.t - l.t > 150) { S.push(cur); cur = []; } cur.push(p); }
+  if (cur.length) S.push(cur);
+  const out = [];
+  for (const s of S) {
+    if (s.length < 6) continue;
+    const d = dist(s[0], s[s.length - 1]); if (d < 80) continue;
+    let path = 0, peak = 0; const speeds = [], angs = [];
+    for (let i = 1; i < s.length; i++) {
+      const seg = dist(s[i], s[i - 1]); path += seg;
+      if (seg > 0) { const v = seg / Math.max(s[i].t - s[i - 1].t, 4); speeds.push(v); peak = Math.max(peak, v); angs.push(Math.atan2(s[i].y - s[i - 1].y, s[i].x - s[i - 1].x)); }
+    }
+    const turns = [];
+    for (let i = 1; i < angs.length; i++) { let a = angs[i] - angs[i - 1]; while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; turns.push(Math.abs(a)); }
+    out.push({ straight: d / path, speedCV: cv(speeds), turn: turns.length ? mean(turns) : 0, peak });
+  }
+  return out;
+}
+
+function behaviourChecks() {
+  const C = [], add = (name, s, detail, pen) => C.push({ name, s, detail, pen });
+  const st = strokes();
+  add('Events come from real input', D.untrusted ? 'fail' : D.trusted ? 'pass' : 'pending',
+    D.untrusted ? `${D.untrusted} script-created events (isTrusted false): ${[...D.untrustedTypes].join(', ')}` : D.trusted ? `All ${D.trusted} events came from the input pipeline` : 'Waiting for input', 70);
+
+  if (D.mouseMoves < 20) add('Pointer events present', 'pending', 'Move the mouse', 40);
+  else add('Pointer events present', D.pointerMoves ? 'pass' : 'fail', D.pointerMoves ? `${D.pointerMoves} pointer / ${D.mouseMoves} mouse moves` : 'Mouse events with no pointer events', 40);
+
+  if (D.firstInput != null) {
+    const d = D.firstInput - LOADED;
+    add('Time before first action', d < 300 ? 'warn' : 'pass', `${Math.round(d)} ms after the page loaded`, 20);
+  }
+
+  if (D.mouseDowns < 3) add('Clicks land where the cursor was', 'pending', 'Click a few buttons', 45);
+  else { const r = D.teleports / D.mouseDowns; add('Clicks land where the cursor was', r > .34 ? 'fail' : D.teleports ? 'warn' : 'pass', D.teleports ? `${D.teleports} of ${D.mouseDowns} clicks away from the cursor` : `All ${D.mouseDowns} clicks followed the cursor`, 45); }
+
+  if (D.btnClicks < 3) add('Hover before click', 'pending', 'Like, comment or follow a few posts', 30);
+  else add('Hover before click', D.unhovered / D.btnClicks > .34 ? 'fail' : D.unhovered ? 'warn' : 'pass', `${D.btnClicks - D.unhovered} of ${D.btnClicks} button clicks were hovered first`, 30);
+
+  if (st.length < 4) {
+    ['Curved, imperfect paths', 'Speed rises and falls', 'Small direction jitter', 'Plausible top speed'].forEach(n => add(n, 'pending', `Longer cursor movements needed (${st.length} of 4)`, 0));
+  } else {
+    const fs = st.filter(s => s.straight > .995).length / st.length;
+    add('Curved, imperfect paths', fs > .5 ? 'fail' : fs > .25 ? 'warn' : 'pass', `${Math.round(fs * 100)}% of ${st.length} movements ruler-straight`, 35);
+    const scv = med(st.map(s => s.speedCV).filter(Number.isFinite));
+    add('Speed rises and falls', scv < .15 ? 'fail' : scv < .3 ? 'warn' : 'pass', `Median speed variation ${f2(scv)}`, 30);
+    const turn = med(st.map(s => s.turn));
+    add('Small direction jitter', turn < .005 ? 'fail' : turn < .02 ? 'warn' : 'pass', `Median heading change ${f2(turn)} rad per step`, 25);
+    const peak = Math.max(...st.map(s => s.peak));
+    add('Plausible top speed', peak > 40 ? 'fail' : peak > 20 ? 'warn' : 'pass', `Fastest ${peak.toFixed(1)} px/ms`, 25);
+  }
+
+  if (D.aim.length < 4) add('Imprecise aim', 'pending', 'Click a few buttons', 25);
+  else { const px = med(D.aim.map(a => a.px)), n = med(D.aim.map(a => a.n)); add('Imprecise aim', px < 1 ? 'fail' : n < .05 ? 'warn' : 'pass', `Median ${px.toFixed(1)} px from button centre`, 25); }
+
+  if (D.dwell.length < 4) add('Natural press length', 'pending', 'Click a few more times', 30);
+  else { const m = med(D.dwell), c = cv(D.dwell); add('Natural press length', m < 20 ? 'fail' : (c < .08 && D.dwell.length >= 5) ? 'warn' : 'pass', `Median ${Math.round(m)} ms, variation ${f2(c)}`, 30); }
+
+  if (D.keyDwell.length < 10) add('Keystroke rhythm', 'pending', 'Write a comment or post', 30);
+  else { const m = med(D.keyDwell), c = cv(D.keyFlight); add('Keystroke rhythm', m < 10 || c < .12 ? 'fail' : m < 25 || c < .2 ? 'warn' : 'pass', `Median key held ${Math.round(m)} ms, gap variation ${f2(c)}`, 30); }
+
+  if (D.scriptSet) add('Text arrives through keys', 'fail', 'Text was submitted without any input events: set by script', 35);
+  else if (!D.fieldInputs) add('Text arrives through keys', 'pending', 'Write a comment or post', 35);
+  else if (!D.pasted && D.fieldChars > D.fieldKeys + 3) add('Text arrives through keys', 'fail', `${D.fieldChars} characters inserted, ${D.fieldKeys} key presses`, 35);
+  else add('Text arrives through keys', D.pasted ? 'warn' : 'pass', D.pasted ? 'Text was pasted' : `${D.fieldKeys} keys for ${D.fieldChars} characters`, 15);
+
+  if (D.scrolls < 3) add('Scrolling follows input', 'pending', 'Scroll the feed', 30);
+  else add('Scrolling follows input', D.scrollNoInput > 2 ? 'fail' : D.scrollNoInput ? 'warn' : 'pass', D.scrollNoInput ? `${D.scrollNoInput} scrolls with no wheel, key, touch or drag` : `${D.scrolls} scroll events, all input-driven`, 30);
+
+  const sp = D.scrollPos;
+  let total = 0; for (let i = 1; i < sp.length; i++) total += Math.abs(sp[i].y - sp[i - 1].y);
+  if (total < 3000) add('Pauses to read', 'pending', `Scroll further (${Math.round(total)} of 3000 px)`, 30);
+  else {
+    let bursts = 1; const v = [];
+    for (let i = 1; i < sp.length; i++) { const dt = sp[i].t - sp[i - 1].t; if (dt > 700) bursts++; else if (dt > 0) v.push(Math.abs(sp[i].y - sp[i - 1].y) / dt); }
+    const per = (bursts - 1) / (total / 1000), c = cv(v);
+    add('Pauses to read', bursts <= 1 || (v.length > 30 && c < .05) ? 'fail' : per < .3 ? 'warn' : 'pass',
+      `${bursts - 1} reading pauses over ${Math.round(total)} px; scroll speed variation ${f2(c)}`, 30);
+  }
+
+  if (D.wheels.length >= 10) {
+    const iv = []; for (let i = 1; i < D.wheels.length; i++) { const d = D.wheels[i].t - D.wheels[i - 1].t; if (d < 1000) iv.push(d); }
+    const c = cv(iv);
+    add('Uneven wheel timing', iv.length >= 8 && c < .08 ? 'warn' : 'pass', `Interval variation ${f2(c)}`, 20);
+  }
+
+  const chrome = (outerHeight || 0) - (innerHeight || 0) > 30;
+  if (D.screenN >= 30) { const r = D.screenEq / D.screenN; add('Screen and page coordinates differ', r > .95 && chrome ? 'fail' : 'pass', r > .95 && chrome ? 'screenX/Y equal clientX/Y: automation-protocol leak' : 'Offsets consistent', 25); }
+  if (D.movN >= 30 && !D.touch) { const r = D.movZero / D.movN; add('Movement deltas reported', r > .9 ? 'fail' : 'pass', r > .9 ? 'movementX/Y stayed zero while moving' : `Present on ${Math.round((1 - r) * 100)}% of moves`, 25); }
+  if (D.pointerMoves > 150) add('Hardware sampling', D.coalescedMulti ? 'pass' : 'warn', D.coalescedMulti ? `Up to ${D.coalescedMax} coalesced samples per frame` : 'One sample per frame only (weak signal, common on trackpads)', 6);
+  return C;
+}
+
+/* ===== Fingerprint consistency ===== */
+const isNative = f => { try { return /\{\s*\[native code\]\s*\}\s*$/.test(Function.prototype.toString.call(f)); } catch { return false; } };
+const osFrom = s => /Windows|Win/.test(s) ? 'Windows' : /Android/.test(s) ? 'Android' : /iPhone|iPad|iPod/.test(s) ? 'iOS' : /Mac/.test(s) ? 'macOS' : /CrOS|Chrome ?OS/i.test(s) ? 'ChromeOS' : /Linux|X11/.test(s) ? 'Linux' : '?';
+function tzOffset(tz, d) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(d).map(x => [x.type, x.value]));
+  return Math.round((Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second) - Math.floor(d.getTime() / 1000) * 1000) / 60000);
+}
+function canvasPrint() {
+  const c = document.createElement('canvas'); c.width = 240; c.height = 40; const x = c.getContext('2d'); if (!x) return '';
+  x.textBaseline = 'top'; x.font = '16px Arial'; x.fillStyle = '#f60'; x.fillRect(110, 1, 62, 20);
+  x.fillStyle = '#069'; x.fillText('Hearth ✓ 1.234', 2, 15); x.fillStyle = 'rgba(102,204,0,0.7)'; x.fillText('Hearth ✓ 1.234', 4, 17);
+  return c.toDataURL();
+}
+function workerNav() {
+  return new Promise(res => {
+    let w, url; const done = v => { try { w && w.terminate(); url && URL.revokeObjectURL(url); } catch {} res(v); };
+    try {
+      url = URL.createObjectURL(new Blob(['postMessage({ua:navigator.userAgent,hc:navigator.hardwareConcurrency,lang:(navigator.languages||[]).join(","),pf:navigator.platform})'], { type: 'text/javascript' }));
+      w = new Worker(url); w.onmessage = e => done(e.data); w.onerror = () => done(null); setTimeout(() => done(null), 1500);
+    } catch { done(null); }
+  });
+}
+async function fingerprintChecks() {
+  const R = [], add = (name, s, detail, pen) => R.push({ name, s, detail, pen });
+  const ua = navigator.userAgent || '', mobile = /Mobi|Android|iPhone|iPad/i.test(ua), chromeUA = /Chrome\//.test(ua), firefoxUA = /Firefox\//.test(ua);
+  add('WebDriver flag', navigator.webdriver ? 'fail' : 'pass', `navigator.webdriver is ${navigator.webdriver}`, 60);
+  let brands = ''; try { brands = (navigator.userAgentData?.brands || []).map(b => b.brand).join(', '); } catch {}
+  const headless = /Headless/i.test(ua + brands);
+  add('Headless browser name', headless ? 'fail' : 'pass', headless ? 'User agent says "Headless"' : 'No headless marker', 60);
+
+  const found = ['__playwright__binding__', '__pwInitScripts', '_playwrightInstance', '__puppeteer_evaluation_script__', 'callPhantom', '_phantom', '__nightmare', 'domAutomation', 'domAutomationController', '_selenium', '__selenium_unwrapped', '__webdriver_evaluate', '__driver_evaluate', '__webdriver_script_fn', '__fxdriver_unwrapped', '_Selenium_IDE_Recorder', 'calledSelenium', '__lastWatirAlert', 'Cypress']
+    .filter(k => { try { return k in window; } catch { return false; } });
+  try { for (const k of Object.getOwnPropertyNames(window)) if (/^\$?cdc_|^__pw|playwright|puppeteer/i.test(k) && !found.includes(k)) found.push(k); } catch {}
+  try { for (const k of Object.getOwnPropertyNames(document)) if (/^\$?cdc_|^\$wdc_|selenium|webdriver/i.test(k)) found.push('document.' + k); } catch {}
+  ['selenium', 'webdriver', 'driver'].forEach(a => { if (document.documentElement.hasAttribute(a)) found.push('<html ' + a + '>'); });
+  add('Automation leftovers', found.length ? 'fail' : 'pass', found.length ? 'Found ' + found.slice(0, 5).join(', ') : 'No Selenium, Puppeteer, Playwright or PhantomJS globals', 60);
+
+  let cdp = false;
+  try { const e = new Error(); Object.defineProperty(e, 'stack', { configurable: false, enumerable: false, get() { cdp = true; return ''; } }); console.debug(e); } catch {}
+  add('Inspector attached', cdp ? 'warn' : 'pass', cdp ? 'Console output is being serialised: CDP automation or open DevTools' : 'Nothing reads console output', 60);
+
+  let plProto = true; try { plProto = navigator.plugins instanceof PluginArray; } catch {}
+  const pl = navigator.plugins ? navigator.plugins.length : 0;
+  add('Plugin list', !plProto ? 'fail' : (pl === 0 && !mobile) ? 'warn' : 'pass', !plProto ? 'navigator.plugins is faked' : `${pl} plugins`, 25);
+  const langs = navigator.languages || [];
+  add('Language list', !langs.length ? 'fail' : (navigator.language && langs[0] !== navigator.language) ? 'warn' : 'pass', langs.length ? langs.join(', ') : 'Empty', 30);
+  if (chromeUA) add('Chrome object present', window.chrome ? 'pass' : 'warn', window.chrome ? 'window.chrome exists' : 'Claims Chrome but window.chrome is missing', 30);
+  try {
+    if (window.Notification && navigator.permissions) {
+      const st = await navigator.permissions.query({ name: 'notifications' });
+      const bad = Notification.permission === 'denied' && st.state === 'prompt';
+      add('Permission state agrees', bad ? 'fail' : 'pass', bad ? 'Denied vs "prompt": classic headless tell' : `${Notification.permission} / ${st.state}`, 40);
+    }
+  } catch {}
+  let rnd = '', glOk = false;
+  try { const gl = document.createElement('canvas').getContext('webgl'); if (gl) { glOk = true; const ext = gl.getExtension('WEBGL_debug_renderer_info'); rnd = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER); } } catch {}
+  const soft = /SwiftShader|llvmpipe|softpipe|Mesa OffScreen|Software Rasterizer/i.test(rnd);
+  add('Graphics hardware', !glOk || soft ? 'warn' : 'pass', !glOk ? 'WebGL unavailable' : soft ? 'Software renderer: ' + rnd : rnd || 'Renderer hidden', 30);
+  add('Window has a frame', !outerWidth || !outerHeight ? 'fail' : 'pass', `Outer ${outerWidth}×${outerHeight}, inner ${innerWidth}×${innerHeight}`, 35);
+  const s = screen, scrBad = !s.width || s.availWidth > s.width || s.availHeight > s.height, scrDef = s.width === 800 && s.height === 600;
+  add('Screen dimensions', scrBad ? 'fail' : scrDef ? 'warn' : 'pass', `${s.width}×${s.height}, available ${s.availWidth}×${s.availHeight}`, 25);
+
+  const tampered = [];
+  if (!isNative(Function.prototype.toString)) tampered.push('Function.prototype.toString');
+  ['webdriver', 'userAgent', 'platform', 'languages', 'plugins', 'hardwareConcurrency', 'deviceMemory', 'vendor'].forEach(p => { const d = Object.getOwnPropertyDescriptor(Navigator.prototype, p); if (d && d.get && !isNative(d.get)) tampered.push('navigator.' + p); });
+  try { const own = Object.getOwnPropertyNames(navigator); if (own.length) tampered.push('own props on navigator: ' + own.slice(0, 3).join(', ')); } catch {}
+  [[HTMLCanvasElement.prototype, 'toDataURL'], [HTMLCanvasElement.prototype, 'getContext'], [window.WebGLRenderingContext && WebGLRenderingContext.prototype, 'getParameter'], [window.Permissions && Permissions.prototype, 'query']]
+    .forEach(([o, k]) => { if (o && o[k] && !isNative(o[k])) tampered.push(k); });
+  add('Built-ins untouched', tampered.length ? 'fail' : 'pass', tampered.length ? 'Overridden: ' + tampered.join(', ') : 'All native', 35);
+
+  const uaOS = osFrom(ua), pfRaw = navigator.platform || ''; let pfOS = osFrom(pfRaw);
+  if (pfOS === 'Linux' && (uaOS === 'Android' || uaOS === 'ChromeOS')) pfOS = uaOS;
+  let chOS = null; try { if (navigator.userAgentData?.platform) chOS = osFrom(navigator.userAgentData.platform); } catch {}
+  const osBad = (pfOS !== '?' && uaOS !== '?' && pfOS !== uaOS) || (chOS && chOS !== '?' && uaOS !== '?' && chOS !== uaOS);
+  add('Operating system agrees', osBad ? 'fail' : 'pass', `UA: ${uaOS}, platform: ${pfRaw || '?'}${chOS ? ', hints: ' + navigator.userAgentData.platform : ''}`, 40);
+
+  const gecko = eval.toString().length === 37 || 'MozAppearance' in document.documentElement.style;
+  const engineBad = (firefoxUA && !gecko) || (!firefoxUA && /Chrome|Safari/.test(ua) && gecko);
+  const noHints = chromeUA && !/OPR|Edg|SamsungBrowser|YaBrowser/.test(ua) && !navigator.userAgentData && isSecureContext;
+  add('Engine matches user agent', engineBad ? 'fail' : noHints ? 'warn' : 'pass', engineBad ? 'Claimed browser and actual engine differ' : noHints ? 'Claims Chrome without client hints' : `Engine: ${gecko ? 'Gecko' : 'Blink/WebKit'}, as claimed`, 40);
+
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone, d = new Date(), a = tzOffset(tz, d), b = -d.getTimezoneOffset();
+    add('Time zone agrees', a !== b ? 'fail' : 'pass', a !== b ? `${tz} implies ${a / 60}h but the clock says ${b / 60}h` : `${tz}, UTC${b >= 0 ? '+' : ''}${b / 60}`, 30);
+  } catch {}
+  const hc = navigator.hardwareConcurrency;
+  add('CPU cores', !hc || hc < 2 ? 'warn' : 'pass', `${hc ?? 'Unknown'} cores${navigator.deviceMemory ? ', ' + navigator.deviceMemory + ' GB' : ''}`, 12);
+  if (/Mobi|Android|iPhone/i.test(ua)) add('Touch on mobile', navigator.maxTouchPoints > 0 ? 'pass' : 'fail', `${navigator.maxTouchPoints} touch points`, 30);
+  const c1 = canvasPrint(), c2 = canvasPrint();
+  add('Stable canvas drawing', c1 && c1 !== c2 ? 'warn' : 'pass', c1 && c1 !== c2 ? 'Identical drawings differ: a fingerprint randomiser is active' : 'Identical drawings match', 25);
+  try {
+    const f = document.createElement('iframe'); f.style.display = 'none'; document.body.appendChild(f);
+    const n = f.contentWindow.navigator, diffs = [];
+    if (n.userAgent !== navigator.userAgent) diffs.push('user agent');
+    if (!!n.webdriver !== !!navigator.webdriver) diffs.push('webdriver');
+    if ((n.languages || []).join() !== langs.join()) diffs.push('languages');
+    if (n.hardwareConcurrency !== navigator.hardwareConcurrency) diffs.push('cores');
+    if (n.platform !== navigator.platform) diffs.push('platform');
+    f.remove();
+    add('Frames agree', diffs.length ? 'fail' : 'pass', diffs.length ? 'Fresh frame differs in ' + diffs.join(', ') : 'Fresh frame matches', 40);
+  } catch { add('Frames agree', 'skip', 'Could not create a test frame', 0); }
+  const w = await workerNav();
+  if (!w) add('Background thread agrees', 'skip', 'Workers unavailable', 0);
+  else {
+    const diffs = [];
+    if (w.ua !== navigator.userAgent) diffs.push('user agent');
+    if (w.hc !== navigator.hardwareConcurrency) diffs.push('cores');
+    if (w.lang !== langs.join(',')) diffs.push('languages');
+    if (w.pf && w.pf !== navigator.platform) diffs.push('platform');
+    add('Background thread agrees', diffs.length ? 'fail' : 'pass', diffs.length ? 'Worker differs in ' + diffs.join(', ') : 'Worker matches', 45);
+  }
+  return R;
+}
+
+/* ===== reCAPTCHA v3 ===== */
+const RC = { state: 'idle', ready: false, last: 0, history: [] };
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = src; s.async = true; s.defer = true;
+    s.onload = res; s.onerror = () => rej(new Error('blocked')); document.head.appendChild(s);
+    setTimeout(() => rej(new Error('timeout')), 10000);
+  });
+}
+async function postJSON(path, body) {
+  const r = await fetch(CFG.verifyBase + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  return r.json();
+}
+async function service(action, force) {
+  if (!RC.ready) return;
+  const now = Date.now();
+  if (!force && now - RC.last < 8000) return;
+  RC.last = now;
+  try {
+    RC.state = 'running';
+    const token = await grecaptcha.execute(CFG.recaptchaKey, { action });
+    const r = await postJSON('/verify/recaptcha', { token, action });
+    RC.history.push({ action, score: r.score, success: r.success, errors: r['error-codes'] || [], at: new Date().toISOString() });
+    RC.state = r.success ? 'ok' : 'error';
+  } catch (e) { RC.state = 'error'; RC.history.push({ action, success: false, errors: [String(e.message || e)] }); }
+}
+function initRecaptcha() {
+  if (!configured(CFG.recaptchaKey)) { RC.state = 'unconfigured'; return; }
+  $('#legal').hidden = false;
+  RC.state = 'loading';
+  loadScript('https://www.google.com/recaptcha/api.js?render=' + encodeURIComponent(CFG.recaptchaKey))
+    .then(() => grecaptcha.ready(() => { RC.ready = true; RC.state = 'ready'; service('page_load', true); }))
+    .catch(() => { RC.state = 'blocked'; });
+  setInterval(() => { if (document.visibilityState === 'visible') service('heartbeat'); }, 45000);
+}
+$('#rerun').addEventListener('click', () => {
+  if (RC.ready) service('manual_check', true);
+  else toast('reCAPTCHA needs self-hosting with your keys');
+});
+initRecaptcha();
+
+/* ===== Widget ===== */
+const WORD = { pass: 'Pass', warn: 'Suspicious', fail: 'Bot signal', pending: 'Waiting', skip: 'Unavailable' };
+const score = l => Math.max(0, Math.round(l.reduce((s, c) => s - (c.s === 'fail' ? c.pen : c.s === 'warn' ? c.pen / 3 : 0), 100)));
+const tone = n => n == null ? 'tone-none' : n >= 75 ? 'tone-ok' : n >= 45 ? 'tone-warn' : 'tone-bad';
+function setRow(id, val, pct, sub, t) {
+  const r = $(id);
+  r.querySelector('.v').textContent = val;
+  r.querySelector('.v').className = 'v ' + t;
+  const m = r.querySelector('.meter'); if (m) { m.className = 'meter ' + t; m.firstElementChild.style.width = (pct ?? 0) + '%'; }
+  r.querySelector('.sub').textContent = sub;
+}
+const SVC_MSG = {
+  unconfigured: 'Not configured: self-host with your keys to enable',
+  blocked: 'Script could not load here (page policy or blocker)',
+  loading: 'Loading', ready: 'Ready', running: 'Checking…', idle: 'Starting'
+};
+let FP = null, BEH = [], tab = null, summary = {};
+function render() {
+  BEH = behaviourChecks();
+  const active = BEH.filter(c => c.s !== 'pending' && c.s !== 'skip').length;
+  const beh = active >= 4 ? score(BEH) : null;
+  const fp = FP ? score(FP) : null;
+  const bf = BEH.filter(c => c.s === 'fail').length, ff = FP ? FP.filter(c => c.s === 'fail').length : 0;
+  setRow('#rBeh', beh ?? '–', beh, beh == null ? `Collecting: ${active} of 4 signals` : `${active} signals, ${bf} bot signal${bf === 1 ? '' : 's'}`, tone(beh));
+  setRow('#rFp', fp ?? '…', fp, fp == null ? 'Running checks' : `${FP.length} checks, ${ff} inconsistenc${ff === 1 ? 'y' : 'ies'}`, tone(fp));
+
+  const last = [...RC.history].reverse().find(h => typeof h.score === 'number');
+  const lastAny = RC.history[RC.history.length - 1];
+  const rc = last ? Math.round(last.score * 100) : null;
+  let rcSub = SVC_MSG[RC.state] || '';
+  if (last) rcSub = `Latest on "${last.action}", ${RC.history.filter(h => typeof h.score === 'number').length} checks`;
+  if (lastAny && !lastAny.success && lastAny.errors?.length) rcSub = 'Error: ' + lastAny.errors.join(', ');
+  setRow('#rRc', last ? last.score.toFixed(1) : '–', rc, rcSub, tone(rc));
+
+  const parts = [[beh, .35], [fp, .3], [rc, .35]].filter(([v]) => v != null);
+  let overall = null;
+  if (beh != null && fp != null) {
+    const wsum = parts.reduce((s, [, w]) => s + w, 0);
+    overall = Math.round(parts.reduce((s, [v, w]) => s + v * w, 0) / wsum);
+    const lo = Math.min(...parts.map(([v]) => v));
+    if (lo < 35) overall = Math.min(overall, lo + 10);
+  }
+  const n = $('#scNum'); n.textContent = overall ?? '–'; n.className = 'sc-num ' + tone(overall);
+  $('#scVerdict').textContent = overall == null ? (fp != null && fp < 45 ? 'Browser looks automated' : 'Interact with the feed')
+    : overall >= 75 ? 'Reads as human' : overall >= 45 ? 'Mixed signals' : 'Reads as automated';
+  summary = { overall, behaviour: beh, fingerprint: fp, recaptchaV3: last ? last.score : null };
+
+  const det = $('#detail');
+  if (tab) {
+    const list = tab === 'beh' ? BEH : (FP || []);
+    det.innerHTML = list.map(c => `<li class="chk" data-s="${c.s}"><span class="m"></span><b>${esc(c.name)}</b><span class="s">${WORD[c.s]}</span><p>${esc(c.detail)}</p></li>`).join('');
+  }
+}
+document.querySelectorAll('[data-tab]').forEach(b => b.addEventListener('click', () => {
+  tab = tab === b.dataset.tab ? null : b.dataset.tab;
+  document.querySelectorAll('[data-tab]').forEach(x => x.setAttribute('aria-pressed', x.dataset.tab === tab));
+  $('#detail').hidden = !tab; render();
+}));
+$('#scToggle').addEventListener('click', () => {
+  const sc = $('#sc'), min = sc.classList.toggle('min');
+  $('#scToggle').setAttribute('aria-expanded', !min);
+  $('#scToggle').setAttribute('aria-label', min ? 'Expand session check' : 'Collapse session check');
+  $('#scToggle svg').style.transform = min ? 'rotate(180deg)' : '';
+});
+$('#copyRep').addEventListener('click', async () => {
+  const rep = {
+    generated: new Date().toISOString(), userAgent: navigator.userAgent, scores: summary,
+    behaviour: BEH.map(c => ({ check: c.name, result: WORD[c.s], detail: c.detail })),
+    fingerprint: (FP || []).map(c => ({ check: c.name, result: WORD[c.s], detail: c.detail })),
+    recaptchaHistory: RC.history
+  };
+  try { await navigator.clipboard.writeText(JSON.stringify(rep, null, 2)); toast('Report copied'); }
+  catch { console.log(rep); toast('Clipboard blocked; report logged to the console'); }
+});
+
+fingerprintChecks().then(r => { FP = r; render(); });
+setInterval(render, 500);
+render();
+
+/* Speed sparkline */
+const spark = $('#spark');
+let col = '', colAt = 0;
+function draw(now) {
+  if (!$('#sc').classList.contains('min')) {
+    if (now - colAt > 1000) { col = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim(); colAt = now; }
+    const dpr = devicePixelRatio || 1, W = Math.round(spark.clientWidth * dpr), H = Math.round(spark.clientHeight * dpr);
+    if (spark.width !== W || spark.height !== H) { spark.width = W; spark.height = H; }
+    const x = spark.getContext('2d'), WIN = 6000, t0 = now - WIN;
+    x.clearRect(0, 0, W, H);
+    while (D.trace.length && D.trace[0].t < t0 - 300) D.trace.shift();
+    const y = v => H - 3 * dpr - Math.min(1, Math.sqrt(v / 8)) * (H - 6 * dpr);
+    x.strokeStyle = col; x.lineWidth = 1.5 * dpr; x.lineJoin = 'round'; x.beginPath();
+    let prev = null;
+    for (const p of D.trace) {
+      const px = (p.t - t0) / WIN * W;
+      if (!prev || p.t - prev.t > 150) { if (prev) x.lineTo((prev.t + 60 - t0) / WIN * W, y(0)); x.moveTo(px, y(0)); }
+      x.lineTo(px, y(p.v)); prev = p;
+    }
+    x.lineTo(prev ? Math.min(W, (Math.min(now, prev.t + 60) - t0) / WIN * W) : 0, y(0));
+    x.lineTo(W, y(0));
+    x.stroke();
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
