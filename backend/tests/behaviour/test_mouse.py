@@ -74,6 +74,50 @@ def test_step_count_grows_with_distance_but_stays_bounded():
     assert long <= 60, "a long sweep must not become hundreds of browser round trips"
 
 
+# --- human_path --------------------------------------------------------------
+
+def _speeds(path):
+    return [math.dist(a[:2], b[:2]) / b[2] for a, b in zip(path, path[1:])]
+
+
+def test_human_path_ends_exactly_on_target():
+    path = mouse.human_path(START, END)
+    assert path[-1][:2] == END
+    assert all(wait > 0 for _, _, wait in path)
+
+
+def test_human_path_speeds_up_then_slows_down():
+    """Constant speed is what sampling a curve at even steps gives; a hand
+    accelerates out of rest and decelerates into the target."""
+    for _ in range(20):
+        speeds = _speeds(mouse.human_path(START, END))
+        third = len(speeds) // 3
+        middle = sum(speeds[third:2 * third]) / third
+        assert middle > 1.5 * sum(speeds[:3]) / 3
+        assert middle > 1.5 * sum(speeds[-3:]) / 3
+
+
+def test_human_path_takes_longer_for_longer_trips():
+    def duration(end):
+        return sum(sum(w for _, _, w in mouse.human_path(START, end)) for _ in range(30))
+
+    assert duration((1300.0, 800.0)) > duration((160.0, 130.0)) * 1.4
+
+
+def test_human_path_has_a_plausible_top_speed():
+    for _ in range(20):
+        # px per second; 20 px/ms is where a page starts calling it robotic.
+        assert max(_speeds(mouse.human_path(START, END))) < 8000
+
+
+def test_human_path_heading_wobbles():
+    """A perfectly smooth sweep has near-zero heading change per step."""
+    path = mouse.human_path(START, END)
+    headings = [math.atan2(b[1] - a[1], b[0] - a[0]) for a, b in zip(path, path[1:])]
+    turns = sorted(abs(b - a) for a, b in zip(headings, headings[1:]))
+    assert turns[len(turns) // 2] > 0.005
+
+
 # --- move_to -----------------------------------------------------------------
 
 @pytest.mark.asyncio

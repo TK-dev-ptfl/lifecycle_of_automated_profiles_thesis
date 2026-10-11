@@ -17,7 +17,7 @@ a real site is a matter of passing a different Environment - plus the variables
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
 from app.behaviour.protocols import KeyboardLike, MouseLike
 
@@ -86,6 +86,34 @@ class Observation:
         return self.exists and self.visible and self.box is not None
 
 
+@dataclass
+class CollectedItem:
+    """One member of a repeated structure - a post in a feed, a row in a table -
+    with its fields already read.
+
+    `index` is its position among its siblings, which is how a caller refers to
+    it again without holding an element handle that may go stale on the next
+    render.
+    """
+
+    index: int
+    box: Optional[Box]
+    fields: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def visible(self) -> bool:
+        return self.box is not None
+
+    def key(self) -> str:
+        """A stable identity for deduplication while scrolling.
+
+        Built from the field values rather than the index, because the index of a
+        given post changes as a feed loads more above it - counting positions
+        would re-read the same post forever or skip ones that shifted.
+        """
+        return "|".join(f"{k}={self.fields.get(k, '')}" for k in sorted(self.fields))
+
+
 @runtime_checkable
 class Environment(Protocol):
     """Everything the behaviour layer is allowed to know about the outside world."""
@@ -108,3 +136,16 @@ class Environment(Protocol):
 
     def now(self) -> float:
         """Seconds since this environment started, on whatever clock it keeps."""
+
+    async def collect(
+        self, target: Target, fields: Mapping[str, str]
+    ) -> list["CollectedItem"]:
+        """Every match of `target`, with `fields` read from inside each one.
+
+        The one thing observe() cannot express: a feed is a repeated structure,
+        and reading it means looking at many siblings and pulling the same few
+        things out of each. `fields` maps a name the algorithm uses ("author",
+        "body") to a query the environment understands - which keeps the
+        algorithm free of any particular site's markup while still letting it ask
+        for exactly what it wants.
+        """

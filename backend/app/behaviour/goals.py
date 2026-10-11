@@ -74,4 +74,37 @@ class WaitFor:
     timeout_s: Optional[float] = None
 
 
-Goal = Union[Wander, Dwell, ScrollTo, ClickOn, TypeInto, WaitFor]
+@dataclass(frozen=True)
+class FeedSchema:
+    """Where the items are and what to read out of each one.
+
+    This is the entire site-specific surface of feed reading. `item` finds the
+    repeated element; `fields` maps the names the algorithm (and the caller) use
+    to queries resolved inside each item. Pointing the same algorithm at a
+    different site means writing a different schema and changing nothing else.
+    """
+
+    item: Target
+    fields: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ReadFeed:
+    """Work down a feed, reading posts the way a person does.
+
+    Not "scrape N items": the reading is the behaviour. Each post is looked at
+    for a time proportional to how much it actually says, the cursor drifts while
+    that happens, and scrolling continues only while new items keep appearing.
+
+    `want` is an upper bound, not a promise - a short feed ends early, which is
+    why the collected items are returned rather than assumed.
+    """
+
+    schema: FeedSchema
+    want: int = 10
+    # Guard against a feed that keeps returning the same items (an infinite
+    # scroll that has stopped loading): give up after this many fruitless scrolls.
+    max_barren_scrolls: int = 3
+
+
+Goal = Union[Wander, Dwell, ScrollTo, ClickOn, TypeInto, WaitFor, ReadFeed]

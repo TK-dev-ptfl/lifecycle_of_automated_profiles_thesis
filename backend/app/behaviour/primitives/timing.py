@@ -67,3 +67,22 @@ def keystroke_delay_ms(words_per_minute: float = 48.0) -> float:
     """
     per_key_ms = 60_000.0 / max(1.0, words_per_minute * 5.0)
     return max(12.0, random.lognormvariate(0.0, 0.42) * per_key_ms)
+
+
+def reading_time_s(text: str, words_per_minute: float = 220.0) -> float:
+    """How long it plausibly takes to read a passage.
+
+    Silent reading of ordinary prose runs around 200-250 wpm, so time spent on a
+    post should scale with how much it says. That matters more than it sounds:
+    dwelling for a constant interval on every item regardless of length is a
+    flat, machine-shaped signal, and dwelling for *no* time at all while still
+    emitting scroll events is worse.
+
+    The floor covers the glance a short post still costs - you look at it, parse
+    who wrote it, and decide to move on, and that is never instant.
+    """
+    words = max(1, len(text.split()))
+    seconds = (words / max(60.0, words_per_minute)) * 60.0
+    # Jitter, because nobody reads two posts at the same speed - and skimming is
+    # as human as reading, hence the wide lower spread.
+    return max(0.35, lognormal_delay(seconds, spread=0.5, cap_s=seconds * 6 + 2))

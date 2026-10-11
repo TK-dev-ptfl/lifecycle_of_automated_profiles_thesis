@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional
+from typing import Mapping, Optional
 
 from playwright.async_api import Page
 
-from app.behaviour.environment import Box, Observation, Target
+from app.behaviour.environment import Box, CollectedItem, Observation, Target
 
 DEFAULT_VIEWPORT = {"width": 1366, "height": 900}
 
@@ -73,10 +73,66 @@ class PlaywrightEnvironment:
             return Observation(exists=False)
 
     async def scroll_by(self, dy: float) -> None:
-        await self.page.evaluate("(d) => window.scrollBy(0, d)", dy)
+        """Scrolls with a wheel event at the cursor, not window.scrollBy.
+
+        A script-driven scroll is a scroll with no input behind it - no wheel,
+        no key, no touch - which is exactly what a page checks for. A wheel
+        event is trusted input; it also scrolls whatever is under the cursor,
+        just as a real wheel does.
+        """
+        await self.mouse.wheel(0, dy)
 
     async def sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
 
     def now(self) -> float:
         return time.monotonic() - self._started
+
+    async def collect(self, target: Target, fields: Mapping[str, str]) -> list[CollectedItem]:
+        """Every element matching `target`, with `fields` read from inside each.
+
+        Field queries are resolved *relative to the item*, not the page, which is
+        what makes them reusable: ".author" means this post's author, however many
+        posts there are. A missing field is an empty string rather than an error -
+        feeds are inconsistent (a post with no image, a repost with no body) and
+        one absent field should not lose the whole item.
+        """
+        items: list[CollectedItem] = []
+        try:
+            matches = self.page.locator(target.query)
+            count = await matches.count()
+        except Exception:
+            return items
+
+        viewport = self.viewport()
+        for index in range(count):
+            item = matches.nth(index)
+            try:
+                raw = await item.bounding_box()
+            except Exception:
+                raw = None
+            # bounding_box() answers for anything laid out, including posts
+            # thousands of pixels below the fold. The port's contract is that an
+            # item has a box only while it is on screen, so off-screen ones get
+            # none here, as they do in the simulator.
+            on_screen = bool(raw) and raw["y"] + raw["height"] > 0 and raw["y"] < viewport.height
+            box = Box(raw["x"], raw["y"], raw["width"], raw["height"]) if on_screen else None
+
+            values: dict[str, str] = {}
+            if box is None:
+                # Nothing can read an off-screen post, so its fields are not
+                # fetched: on a long feed that is most of the round trips.
+                items.append(CollectedItem(index=index, box=None, fields=values))
+                continue
+            for name, query in fields.items():
+                try:
+                    node = item.locator(query).first
+                    values[name] = (
+                        (await node.inner_text(timeout=400)).strip()
+                        if await node.count() > 0
+                        else ""
+                    )
+                except Exception:
+                    values[name] = ""
+            items.append(CollectedItem(index=index, box=box, fields=values))
+        return items

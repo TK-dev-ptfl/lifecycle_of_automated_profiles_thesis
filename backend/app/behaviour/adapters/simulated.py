@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from app.behaviour.environment import Box, Observation, Point, Target
+from app.behaviour.environment import Box, CollectedItem, Observation, Point, Target
 
 
 @dataclass
@@ -35,6 +35,11 @@ class SimElement:
     kind: str = "button"          # button | input | text
     value: str = ""               # for inputs: what has been typed
     text: str = ""
+    # Repeated structures (a feed) are modelled by giving several elements the
+    # same `group`, and putting the readable parts in `fields`. That is the
+    # simulator's equivalent of "these DOM nodes all match .post".
+    group: str = ""
+    fields: dict = field(default_factory=dict)
     clicks: int = 0
     page_box: Box = field(init=False)
 
@@ -98,6 +103,25 @@ class SimulatedEnvironment:
             text=element.text,
             extra={"clicks": element.clicks, "kind": element.kind},
         )
+
+    async def collect(self, target: Target, fields) -> list[CollectedItem]:
+        members = [e for e in self.elements.values() if e.group == target.query]
+        # Document order, which is what a DOM query returns and what the reading
+        # algorithm assumes when it works top to bottom.
+        members.sort(key=lambda e: (e.y, e.x))
+
+        collected = []
+        for index, element in enumerate(members):
+            box = self.viewport_box_of(element)
+            on_screen = box.y + box.height > 0 and box.y < self.height
+            collected.append(
+                CollectedItem(
+                    index=index,
+                    box=box if on_screen else None,
+                    fields={name: str(element.fields.get(key, "")) for name, key in fields.items()},
+                )
+            )
+        return collected
 
     async def scroll_by(self, dy: float) -> None:
         self.scroll_y = max(0.0, min(self.page_height - self.height, self.scroll_y + dy))

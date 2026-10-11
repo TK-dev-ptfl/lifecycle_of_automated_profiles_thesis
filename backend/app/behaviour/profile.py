@@ -49,6 +49,13 @@ class BehaviourProfile:
     wander_range: tuple[int, int] = (2, 4)
     # Seconds to keep waiting for something expected to appear.
     patience_s: float = 20.0
+    # How much the hand moves while nothing is being done: the share of idle
+    # moments that see some motion rather than a resting mouse. Nobody is at 0
+    # (a cursor frozen for a whole session is nobody's) and nobody is at 1.
+    restlessness: float = 0.5
+    # Chance, per post, of following its text with the cursor while reading -
+    # a habit some people have strongly and others not at all.
+    reads_with_cursor: float = 0.3
 
     # --- derived helpers -----------------------------------------------------
     def think_s(self) -> float:
@@ -100,11 +107,15 @@ def derive_for(identity_key: str, base: BehaviourProfile = AVERAGE) -> Behaviour
         typing_wpm=max(18.0, rng.gauss(base.typing_wpm, base.typing_wpm * 0.3)),
         typo_chance=max(0.0, min(0.06, rng.gauss(0.015, 0.012))),
         aim_scatter=min(0.45, max(0.15, rng.gauss(base.aim_scatter, 0.07))),
-        path_curviness=min(0.4, max(0.08, rng.gauss(base.path_curviness, 0.07))),
+        # Floor at 0.12: below that a path's bow is within the noise of a
+        # straight line, and ruler-straight travel is a classic bot signal.
+        path_curviness=min(0.4, max(0.12, rng.gauss(base.path_curviness, 0.07))),
         overshoot_chance=min(1.0, max(0.3, rng.gauss(base.overshoot_chance, 0.15))),
         hesitancy=min(2.5, max(0.4, rng.gauss(base.hesitancy, 0.35))),
         wander_range=_jitter_range(base.wander_range, rng),
         patience_s=max(8.0, rng.gauss(base.patience_s, 4.0)),
+        restlessness=min(0.85, max(0.2, rng.gauss(base.restlessness, 0.18))),
+        reads_with_cursor=min(0.8, max(0.0, rng.gauss(base.reads_with_cursor, 0.2))),
     )
 
 

@@ -9,6 +9,7 @@ minutes of hesitation cost microseconds.
 from __future__ import annotations
 
 import asyncio
+import math
 
 import pytest
 
@@ -137,12 +138,48 @@ async def test_typing_verification_catches_a_field_that_did_not_take_the_text():
 # --- Wander ------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_wandering_is_a_continuous_path_of_press_move_release():
+async def test_wandering_hovers_without_pressing_anything():
+    """Pressing at random points selects text, starts drags and focuses inputs -
+    visible side effects an idle hand does not cause."""
     env = world()
     await actor(env).pursue([Wander(count=3)])
 
-    kinds = [e[0] for e in env.events if e[0] in ("down", "up")]
-    assert kinds == ["down", "up"] * 3, "gestures must not overlap or teleport"
+    assert not [e for e in env.events if e[0] in ("down", "up")]
+    assert len(env.path) > 3 * 5, "each wander should be a movement, not a hop"
+
+
+@pytest.mark.asyncio
+async def test_wandering_is_one_continuous_path():
+    env = world()
+    await actor(env).pursue([Wander(count=4)])
+
+    # Entry aside, no sample jumps further than a fast hand covers in one frame.
+    steps = [math.dist(a, b) for a, b in zip(env.path[1:], env.path[2:])]
+    assert max(steps) < 120
+
+
+# --- Arrival and idling ------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_the_cursor_arrives_across_the_top_edge_of_the_page():
+    """A just-loaded page has had no pointer over it; the first one comes in from
+    the browser's toolbar, not out of nowhere in the middle."""
+    env = world()
+    await actor(env).pursue([Dwell(seconds=1.0), Wander(count=1)])
+
+    first_x, first_y = env.path[0]
+    assert first_y < 10
+    assert 0 < first_x < env.width
+
+
+@pytest.mark.asyncio
+async def test_the_hand_is_not_frozen_while_dwelling():
+    env = world()
+    a = actor(env, AVERAGE.with_(restlessness=0.7))
+    await a.pursue([Dwell(seconds=20.0)])
+
+    assert len(set(env.path)) > 10, "a long dwell should see the cursor move"
+    assert not [e for e in env.events if e[0] in ("down", "up")]
 
 
 @pytest.mark.asyncio

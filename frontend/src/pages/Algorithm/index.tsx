@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { METHOD_LABELS, METHOD_DESC, type MethodType } from '../../data/algorithms'
 import { getMethodFiles } from '../../api/algorithms'
+import BehaviourRunner from './BehaviourRunner'
 
 const METHOD_ORDER: MethodType[] = [
   'official_api',
@@ -59,7 +60,7 @@ export default function AlgorithmPage() {
           <pre className="px-4 py-3 font-mono text-xs text-gray-300 whitespace-pre overflow-x-auto">{WRAPPER_CODE}</pre>
         </div>
 
-        
+        <BehaviourRunner />
 
         {isLoading ? (
           <div className="rounded-xl border border-gray-700/50 bg-gray-800/30 p-4 text-sm text-gray-500">Loading files...</div>
