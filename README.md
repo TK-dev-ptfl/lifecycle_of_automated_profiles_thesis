@@ -2,6 +2,20 @@
 
 ---
 
+## Dokumentácia
+
+| Dokument | Obsah |
+| --- | --- |
+| [docs/STATUS.md](docs/STATUS.md) | Stav implementácie oproti textu práce, kapitola po kapitole |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Ďalší postup, fázy, hypotézy, otvorené rozhodnutia |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Mapa kódu, spustenie, vrstvy a služby |
+| [docs/TEST_ENVIRONMENT.md](docs/TEST_ENVIRONMENT.md) | Meranie ľudskosti algoritmov: čo prostredie meria, prečo je to platné (literatúra, validácia), obmedzenia, protokol experimentu |
+| [backend/tests/behaviour/test_env/VALIDATION.md](backend/tests/behaviour/test_env/VALIDATION.md) | Kontroly feed labu na nahraných ľuďoch a botoch |
+| [backend/tests/behaviour/test_env/feed-lab/README.md](backend/tests/behaviour/test_env/feed-lab/README.md) | Testovací feed s detektormi |
+| [backend/tests/behaviour/test_env/bot_model/README.md](backend/tests/behaviour/test_env/bot_model/README.md) | Klasifikátor pohybu myši, dáta, tréning ([REPORT](backend/tests/behaviour/test_env/bot_model/REPORT.md)) |
+
+---
+
 ## Cieľ projektu
 
 Cieľom práce je systematicky preskúmať životný cyklus automatizovaných účtov (botov) na sociálnych sieťach — od vytvorenia cez budovanie dôvery až po vykonávanie konkrétnych úloh. Výskum sa zameriava na porovnanie rôznych stratégií správania a interakcie so sieťou z hľadiska viacerých skúmaných vlastností, pričom poskytuje náhľad na spôsoby zneužitia siete automatizovanými nástrojmi.
@@ -33,10 +47,22 @@ Dôvod: otvorené API, sandbox cez privátny subreddit, karma systém poskytuje 
 | Reddit warm-up pipeline (manuálne)      | 01.05.2026 | 02.05.2026 |
 | písanie kapitola 2                      | 05.05.2026 | 07.05.2026 |
 | písanie kapitola 3                      | 07.05.2026 | 10.05.2026 |
+| email pipeline automatizácia (Tuta, scheduler) | 21.09.2026 | 05.10.2026 |
+| Webshare proxy                          | 30.09.2026 | 30.09.2026 |
+| behaviorálna vrstva (myš, klávesnica, scroll, profily) | 07.10.2026 | 11.10.2026 |
+| Reddit creation pipeline, kroky 1–7 (po overenie emailu) | 07.10.2026 | 07.10.2026 |
+| testovací feed lab                      | 07.10.2026 | 11.10.2026 |
+| konzistentný fingerprint per identita   | 11.10.2026 | 16.10.2026 |
+| detektory (CreepJS, rebrowser), robotická kontrola, klasifikátor myši | 11.10.2026 | 16.10.2026 (necommitnuté) |
+
+Dátumy podľa git histórie (prvý a posledný commit danej časti).
 
 ---
 
 ### 🔲 Zostatok
+
+> Pôvodný plán. Termíny sú prekročené (stav k 16.10.2026); aktuálny postup je v
+> [docs/ROADMAP.md](docs/ROADMAP.md).
 
 | Úloha                            | Od         | Do         |
 | -------------------------------- | ---------- | ---------- |

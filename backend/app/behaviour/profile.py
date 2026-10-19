@@ -32,6 +32,10 @@ class BehaviourProfile:
     typing_wpm: float = 48.0
     # Per-character chance of hitting a neighbouring key and correcting it.
     typo_chance: float = 0.0
+    # Median time a key stays down, keydown to keyup. 86 ms is the median of
+    # the CMU keystroke benchmark (Killourhy & Maxion 2009); its typists'
+    # own medians range 45-142 ms, so derive_for spreads identities over that.
+    key_hold_ms: float = 86.0
     # How far a click may land from an element's centre, as a fraction of its
     # size. 0 would mean pixel-perfect centre clicks every time, which is a
     # stronger signal than any amount of jitter.
@@ -116,6 +120,9 @@ def derive_for(identity_key: str, base: BehaviourProfile = AVERAGE) -> Behaviour
         patience_s=max(8.0, rng.gauss(base.patience_s, 4.0)),
         restlessness=min(0.85, max(0.2, rng.gauss(base.restlessness, 0.18))),
         reads_with_cursor=min(0.8, max(0.0, rng.gauss(base.reads_with_cursor, 0.2))),
+        # Drawn last so adding it left every earlier trait of an existing
+        # identity unchanged.
+        key_hold_ms=min(142.0, max(45.0, rng.gauss(base.key_hold_ms, 22.0))),
     )
 
 

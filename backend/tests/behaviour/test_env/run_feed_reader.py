@@ -7,7 +7,7 @@
     cd backend
     PYTHONPATH=. .venv/Scripts/python.exe tests/behaviour/test_env/run_feed_reader.py
 
-Flags: --headless, --show-cursor, --want N, --identity NAME, --url URL, --scenario KEY
+Flags: --headless, --show-cursor, --no-proxy, --no-evaluate, --public-checks, --manual-minutes M, --want N, --identity NAME, --url URL, --scenario KEY
 
 The same thing the dashboard's Algorithm page runs, and deliberately the same
 code: the scenario (where the posts are and what to read from each) lives in
@@ -31,6 +31,14 @@ async def main() -> int:
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--show-cursor", action="store_true",
                     help="draw the simulated pointer (debug only; the page can see it)")
+    ap.add_argument("--no-proxy", action="store_true",
+                    help="go out on this machine's own address instead of a proxy from the list")
+    ap.add_argument("--no-evaluate", action="store_true",
+                    help="skip the mouse classifier and the rebrowser/CreepJS detectors")
+    ap.add_argument("--manual-minutes", type=float, default=10.0,
+                    help="feed-lab-manual only: end the session after this long if Finish is not clicked")
+    ap.add_argument("--public-checks", action="store_true",
+                    help="also visit public detector pages (sannysoft, BrowserScan, ...); proxy only")
     args = ap.parse_args()
 
     if args.scenario not in behaviour_run_service.SCENARIOS:
@@ -43,6 +51,10 @@ async def main() -> int:
         want=args.want,
         headless=args.headless,
         show_cursor=args.show_cursor,
+        use_proxy=not args.no_proxy,
+        evaluate=not args.no_evaluate,
+        public_checks=args.public_checks,
+        manual_minutes=args.manual_minutes,
         url=args.url,
     )
 
@@ -63,6 +75,11 @@ async def main() -> int:
     if run.status == "failed":
         print(f"\nFAILED: {run.error}")
         return 1
+
+    if run.proxy:
+        print("\n--- through ---")
+        for key, value in run.proxy.items():
+            print(f"  {key:<10} {value}")
 
     if run.fingerprint:
         print("\n--- presented as ---")
@@ -92,7 +109,43 @@ async def main() -> int:
             for c in bad:
                 print(f"    [{c['state']}] ({c.get('group', '?')}) {c['name']}: {c['detail']}")
 
-    return 0 if run.items else 1
+    ev = run.evaluation or {}
+    if ev:
+        print("\n--- independent judges ---")
+        m = ev.get("mouse_model") or {}
+        if m:
+            extra = f" (bot probability {m['bot_probability']}, {m.get('bot_like_strokes')}/{m['strokes']} strokes bot-like)" if "bot_probability" in m else ""
+            print(f"  mouse classifier  {m.get('verdict')}{extra}")
+        rb = ev.get("rebrowser") or {}
+        if "checks" in rb:
+            print(f"  rebrowser         {len(rb['detected'])} leak(s) detected")
+            for c in rb["checks"]:
+                if c["state"] != "pass":
+                    print(f"    [{c['state']}] {c['name']}: {c['detail'][:110]}")
+        elif rb:
+            print(f"  rebrowser         {rb.get('error')}")
+        cj = ev.get("creepjs") or {}
+        if "headless" in cj:
+            print(f"  creepjs           headless {cj['headless']}%, like headless {cj['like_headless']}%, "
+                  f"stealth {cj['stealth']}%, {cj['lie_count']} lie(s), worker lied: {cj['worker_lied']}")
+            flags = cj["headless_flags"] + cj["stealth_flags"]
+            if flags:
+                print(f"    flags: {', '.join(flags)}")
+            for api, why in list(cj["lies"].items())[:8]:
+                print(f"    lie: {api} - {', '.join(why) if isinstance(why, list) else why}")
+        elif cj:
+            print(f"  creepjs           {cj.get('error')}")
+        for page in ev.get("public") or []:
+            if "error" in page:
+                print(f"  {page.get('name', 'public'):<17} {page['error']}")
+            elif "passed" in page:
+                print(f"  {page['name']:<17} {page['passed']} passed, failed: {page['failed'] or 'none'}, warn: {page['warned'] or 'none'}")
+            else:
+                print(f"  {page['name']:<17} see screenshot; " + " | ".join(page.get("highlights", [])[:3])[:150])
+        if run.artifacts_dir:
+            print(f"\n  screenshots and trace: {run.artifacts_dir}")
+
+    return 0 if run.items or run.style == "manual" else 1
 
 
 if __name__ == "__main__":

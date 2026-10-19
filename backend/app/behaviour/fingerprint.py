@@ -59,6 +59,25 @@ COUNTRIES: dict[str, tuple[str, tuple[str, ...], str]] = {
     "NL": ("nl-NL", ("nl", "en"), "Europe/Amsterdam"),
 }
 
+# Countries a proxy can exit in but the Identities page never generates. A
+# persona is only placed in COUNTRIES; these exist so a fingerprint can follow
+# a proxy anywhere it lands without falling back to the wrong language.
+_PROXY_COUNTRIES: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "ES": ("es-ES", ("es", "en"), "Europe/Madrid"),
+    "IT": ("it-IT", ("it", "en"), "Europe/Rome"),
+    "PT": ("pt-PT", ("pt", "en"), "Europe/Lisbon"),
+    "BE": ("nl-BE", ("nl", "fr", "en"), "Europe/Brussels"),
+    "CH": ("de-CH", ("de", "fr", "en"), "Europe/Zurich"),
+    "SE": ("sv-SE", ("sv", "en"), "Europe/Stockholm"),
+    "RO": ("ro-RO", ("ro", "en"), "Europe/Bucharest"),
+    "CA": ("en-CA", ("en", "fr"), "America/Toronto"),
+    "JP": ("ja-JP", ("ja", "en"), "Asia/Tokyo"),
+    "BR": ("pt-BR", ("pt", "en"), "America/Sao_Paulo"),
+    "IN": ("en-IN", ("en", "hi"), "Asia/Kolkata"),
+    "SG": ("en-SG", ("en",), "Asia/Singapore"),
+    "AU": ("en-AU", ("en",), "Australia/Sydney"),
+}
+
 # (browser, Playwright channel, weight) per OS. The Chromium-family rows of the
 # Identities page's HW_COMBOS: Firefox and Safari are left out because the
 # driver is Chromium-only here, and claiming them from Blink fails every engine
@@ -226,12 +245,20 @@ def fingerprint_for(
     identity_key: str,
     country_code: Optional[str] = None,
     os_name: Optional[str] = None,
+    timezone: Optional[str] = None,
 ) -> Fingerprint:
     """A stable, distinct, internally consistent fingerprint for one identity.
 
     Seeded from the identity key the way derive_for() seeds the behaviour
     profile, but salted so the two are not correlated: the same identity always
     gets the same machine, and its typing speed says nothing about its screen.
+
+    country_code and timezone place the identity where its traffic exits. When
+    it goes through a proxy they come from a lookup of the proxy's exit IP, so
+    language and clock agree with the address a site sees - a Slovak time zone
+    on a London IP is the very mismatch IP-reputation checks look for. Only the
+    place changes: the machine (screen, GPU, browser) stays the same for the
+    identity wherever it connects from.
     """
     digest = hashlib.sha256(f"fingerprint:{identity_key}".encode("utf-8")).digest()
     rng = random.Random(int.from_bytes(digest[:8], "big"))
@@ -239,8 +266,14 @@ def fingerprint_for(
     os_name = os_name or host_os()
     browsers = _BROWSERS[os_name]
     browser, channel, _ = rng.choices(browsers, weights=[b[2] for b in browsers])[0]
-    cc = (country_code or rng.choice(sorted(COUNTRIES))).upper()
-    locale, languages, timezone = COUNTRIES.get(cc, COUNTRIES["US"])
+    # Drawn even when a country is supplied, so the draws after it - screen,
+    # GPU - are the same with and without a proxy.
+    drawn = rng.choice(sorted(COUNTRIES))
+    cc = (country_code or drawn).upper()
+    places = {**_PROXY_COUNTRIES, **COUNTRIES}
+    # An exit country with no table entry gets US English and the exit's zone.
+    locale, languages, zone = places.get(cc, ("en-US", ("en",), "America/New_York"))
+    timezone = timezone or zone
 
     phys_w, phys_h, dpr = rng.choice(_SCREENS[os_name])
     screen_w, screen_h = round(phys_w / dpr), round(phys_h / dpr)
@@ -281,7 +314,7 @@ def fingerprint_for(
 IGNORE_DEFAULT_ARGS = ["--enable-automation"]
 
 
-def launch_args(fp: Fingerprint, headless: bool) -> list[str]:
+def launch_args(fp: Fingerprint, headless: bool, proxied: bool = False) -> list[str]:
     """Browser flags for this fingerprint.
 
     AutomationControlled is what sets navigator.webdriver: turning the feature
@@ -297,6 +330,11 @@ def launch_args(fp: Fingerprint, headless: bool) -> list[str]:
         "--no-first-run",
         "--no-default-browser-check",
     ]
+    if proxied:
+        # WebRTC talks UDP straight to STUN servers, around an HTTP proxy, and
+        # hands the page the machine's real public address. This keeps it to
+        # the proxy, as a privacy-minded browser configuration would.
+        args.append("--webrtc-ip-handling-policy=disable_non_proxied_udp")
     if not headless:
         w, h = fp.window_size
         args.append(f"--window-size={w},{h}")
@@ -317,15 +355,31 @@ def context_options(fp: Fingerprint) -> dict[str, Any]:
     return options
 
 
-async def launch(pw, fp: Fingerprint, *, headless: bool, log=lambda _m: None):
+async def launch(pw, fp: Fingerprint, *, headless: bool, log=lambda _m: None, proxy: Optional[dict] = None):
     """Launches the browser this fingerprint claims, falling back to Playwright's
     bundled Chromium when that browser is not installed - in which case the
-    fingerprint is re-labelled Chrome, since Chromium cannot pass for Edge."""
+    fingerprint is re-labelled Chrome, since Chromium cannot pass for Edge.
+
+    `proxy` is a Playwright proxy config, applied to the whole browser so that
+    nothing - not the scratch context that reads the browser, not a worker -
+    goes out directly. Loopback stays direct (Chromium's default), which is
+    what lets a local test page load while everything it calls out to, Google
+    included, sees only the proxy.
+
+    No user_data_dir is passed, so every launch is a fresh temporary profile:
+    no cookies, storage or history from any earlier run or from the host's own
+    browser.
+    """
     kwargs = {
         "headless": headless,
-        "args": launch_args(fp, headless),
+        "args": launch_args(fp, headless, proxied=proxy is not None),
         "ignore_default_args": IGNORE_DEFAULT_ARGS,
     }
+    if proxy is not None:
+        # Playwright otherwise adds "<-loopback>" and sends localhost through
+        # the proxy too, where a page served on this machine cannot be reached.
+        bypass = ",".join(filter(None, [proxy.get("bypass"), "<loopback>"]))
+        kwargs["proxy"] = {**proxy, "bypass": bypass}
     try:
         return await pw.chromium.launch(channel=fp.channel, **kwargs), fp
     except Exception as exc:

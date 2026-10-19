@@ -24,6 +24,19 @@ async def test_typing_sends_one_key_per_character():
 
 
 @pytest.mark.asyncio
+async def test_keys_are_held_down_for_a_human_length_of_time():
+    """press() with no delay releases the key in the same instant it goes
+    down - a 0-2 ms hold that the feed lab flags and no keyboard produces.
+    Human holds are around 86 ms (CMU keystroke benchmark), and vary."""
+    kb, sleeper = RecordingKeyboard(), RecordingSleeper()
+    await keyboard.type_text(kb, "a" * 200, sleeper=sleeper)
+
+    assert all(h is not None and h >= 25 for h in kb.holds), "a key was released instantly"
+    assert 65 < statistics.median(kb.holds) < 110
+    assert statistics.stdev(kb.holds) > 10, "holds are nearly constant"
+
+
+@pytest.mark.asyncio
 async def test_keystroke_gaps_are_uneven():
     """Evenly spaced keystrokes are one of the most obvious automation tells."""
     kb, sleeper = RecordingKeyboard(), RecordingSleeper()

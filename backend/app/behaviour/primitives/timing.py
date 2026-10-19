@@ -69,6 +69,18 @@ def keystroke_delay_ms(words_per_minute: float = 48.0) -> float:
     return max(12.0, random.lognormvariate(0.0, 0.42) * per_key_ms)
 
 
+def keystroke_hold_ms(median_ms: float = 86.0) -> float:
+    """How long one key stays down, from keydown to keyup.
+
+    Calibrated on the CMU keystroke benchmark (Killourhy & Maxion, DSN 2009;
+    51 typists, 224,400 key holds): median 86 ms, 5th-95th percentile
+    49-145 ms, and log-normal with a sigma of about 0.34. A key released the
+    instant it goes down - what Playwright's press() does without a delay -
+    is held for 0-2 ms, which no keyboard produces.
+    """
+    return min(3.0 * median_ms, max(25.0, random.lognormvariate(0.0, 0.34) * median_ms))
+
+
 def reading_time_s(text: str, words_per_minute: float = 220.0) -> float:
     """How long it plausibly takes to read a passage.
 

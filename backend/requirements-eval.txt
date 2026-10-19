@@ -1,0 +1,4 @@
+# Only for training the behaviour classifier (tests/behaviour/test_env/bot_model/train.py).
+# The backend scores runs with the exported model in pure Python and needs none of this.
+numpy>=2
+scikit-learn>=1.5

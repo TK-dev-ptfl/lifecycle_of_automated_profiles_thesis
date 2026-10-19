@@ -52,6 +52,15 @@ class BehaviourRunRequest(BaseModel):
     # Draws the simulated pointer so a headed run can be watched. Debug only:
     # the overlay is an element in the page and any site can detect it.
     show_cursor: bool = False
+    # Use a proxy from the list (read-only; nothing is claimed or consumed).
+    use_proxy: bool = True
+    # Independent judges after the session: trained mouse classifier, plus the
+    # vendored rebrowser and CreepJS detectors.
+    evaluate: bool = True
+    # Also visit public detector pages (proxy only - they log visitors).
+    public_checks: bool = False
+    # Manual scenario only: the session ends at Finish, or after this long.
+    manual_minutes: float = Field(default=10.0, ge=1.0, le=60.0)
     # Overrides the scenario's own URL, for pointing the same algorithm at a
     # different host or port without editing the scenario.
     url: Optional[str] = None
@@ -66,6 +75,16 @@ async def list_behaviour_scenarios(_: str = Depends(get_current_user)):
 @router.get("/behaviour-runs")
 async def list_behaviour_runs(limit: int = 10, _: str = Depends(get_current_user)):
     return behaviour_run_service.list_runs(limit)
+
+
+@router.get("/behaviour-compare")
+async def compare_behaviour_runs(ids: str, _: str = Depends(get_current_user)):
+    """Runs side by side - e.g. a manual (human) session, the algorithm and
+    the robotic control. `ids` is a comma-separated list of run ids."""
+    wanted = [i.strip() for i in ids.split(",") if i.strip()]
+    if not wanted:
+        raise HTTPException(status_code=422, detail="Give at least one run id")
+    return behaviour_run_service.compare(wanted[:6])
 
 
 @router.get("/behaviour-runs/{run_id}")
@@ -94,6 +113,10 @@ async def start_behaviour_run(
         want=body.want,
         headless=body.headless,
         show_cursor=body.show_cursor,
+        use_proxy=body.use_proxy,
+        evaluate=body.evaluate,
+        public_checks=body.public_checks,
+        manual_minutes=body.manual_minutes,
         url=body.url,
     )
     return run.as_dict()

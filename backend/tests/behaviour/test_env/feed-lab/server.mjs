@@ -75,6 +75,25 @@ http.createServer(async (req, res) => {
       return res.end(html);
     }
 
+    // Third-party detectors (see vendor/README.md), served from this origin so
+    // they run against the same browser session the lab scores.
+    if (req.method === 'GET' && url.pathname.startsWith('/vendor/')) {
+      const vendorDir = path.join(dir, 'vendor');
+      let rel = decodeURIComponent(url.pathname.slice('/vendor/'.length));
+      if (rel === '' || rel.endsWith('/')) rel += 'index.html';
+      const file = path.resolve(vendorDir, rel);
+      // Never outside vendor/, whatever the URL says.
+      if (!file.startsWith(vendorDir + path.sep) || !existsSync(file)) {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        return res.end('Not found');
+      }
+      const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css',
+                      '.json': 'application/json', '.ico': 'image/x-icon', '.png': 'image/png', '.svg': 'image/svg+xml',
+                      '.woff2': 'font/woff2', '.txt': 'text/plain' };
+      res.writeHead(200, { 'content-type': types[path.extname(file).toLowerCase()] || 'application/octet-stream', 'cache-control': 'no-store' });
+      return res.end(await readFile(file));
+    }
+
     if (req.method === 'POST' && url.pathname === '/verify/recaptcha') {
       if (!RECAPTCHA_SECRET) return json(res, 501, { success: false, 'error-codes': ['server-missing-RECAPTCHA_SECRET'] });
       const { token, action } = await readBody(req);

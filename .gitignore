@@ -108,3 +108,8 @@ desktop.ini
 *.tmp
 *.temp
 .cache/
+
+# Behaviour classifier datasets (downloaded; see backend/tests/behaviour/test_env/bot_model/README.md)
+backend/tests/behaviour/test_env/bot_model/data/
+# Behaviour run artefacts (screenshots, traces)
+backend/tests/behaviour/test_env/runs/

@@ -57,6 +57,34 @@ def test_language_tags_take_the_shape_chrome_builds():
     assert fingerprint_for("x", country_code="US").language_tags == ("en-US", "en")
 
 
+def test_a_proxy_moves_the_place_but_not_the_machine():
+    """Behind a proxy, language and clock follow the exit; the screen, GPU and
+    browser stay the identity's own."""
+    home = fingerprint_for("identity-a")
+    away = fingerprint_for("identity-a", country_code="GB", timezone="Europe/London")
+    assert (away.locale, away.timezone) == ("en-GB", "Europe/London")
+    for attr in ("browser", "screen_width", "screen_height", "viewport_width", "webgl_renderer", "canvas_seed"):
+        assert getattr(home, attr) == getattr(away, attr)
+
+
+def test_the_exit_zone_wins_over_the_countrys_default():
+    fp = fingerprint_for("identity-a", country_code="US", timezone="America/Los_Angeles")
+    assert fp.timezone == "America/Los_Angeles" and fp.locale == "en-US"
+
+
+def test_an_unlisted_exit_country_still_gets_a_coherent_place():
+    assert fingerprint_for("x", country_code="JP", timezone="Asia/Tokyo").language_tags[0] == "ja-JP"
+    unknown = fingerprint_for("x", country_code="ZZ", timezone="Africa/Lagos")
+    assert (unknown.locale, unknown.timezone) == ("en-US", "Africa/Lagos")
+
+
+def test_a_proxied_launch_keeps_webrtc_on_the_proxy():
+    fp = fingerprint_for("identity-a")
+    flag = "--webrtc-ip-handling-policy=disable_non_proxied_udp"
+    assert flag in fp_mod.launch_args(fp, headless=True, proxied=True)
+    assert flag not in fp_mod.launch_args(fp, headless=True)
+
+
 def test_binding_takes_the_real_browser_and_drops_the_headless_marker():
     fp = fingerprint_for("identity-a").bind(REAL)
     assert "Headless" not in fp.user_agent

@@ -43,9 +43,12 @@ class RecordingKeyboard:
     def __init__(self) -> None:
         self.pressed: list[str] = []
         self.typed: list[str] = []
+        # The delay passed to each press: how long the key was held, in ms.
+        self.holds: list[Optional[float]] = []
 
     async def press(self, key: str, *, delay: Optional[float] = None) -> None:
         self.pressed.append(key)
+        self.holds.append(delay)
 
     async def type(self, text: str, *, delay: Optional[float] = None) -> None:
         self.typed.append(text)

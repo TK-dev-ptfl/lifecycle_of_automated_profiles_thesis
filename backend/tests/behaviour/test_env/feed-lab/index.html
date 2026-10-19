@@ -195,6 +195,7 @@ button{cursor:pointer}
       <button data-tab="fp" aria-pressed="false">Fingerprint details</button>
       <button id="rerun">Re-run services</button>
       <button id="copyRep">Copy report</button>
+      <button id="finish" hidden>Finish session</button>
     </div>
     <ul class="checks" id="detail" hidden></ul>
     <p class="legal" id="legal" hidden>This site is protected by reCAPTCHA and the Google <a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Privacy Policy</a> and <a href="https://policies.google.com/terms" target="_blank" rel="noopener">Terms of Service</a> apply.</p>
@@ -370,6 +371,21 @@ const fresh = () => ({
 });
 let D = fresh();
 const opt = { capture: true, passive: true };
+
+/* Full input trace, for offline analysis (the behaviour classifier in
+   tests/behaviour/test_env/bot_model). The checks above keep rolling windows;
+   this keeps everything, timestamped from page load, and is read back once at
+   the end of a run. Positions only, never which keys were typed. */
+const TRACE = { origin: performance.timeOrigin, moves: [], downs: [], ups: [], wheels: [], keys: [], scrolls: [] };
+const cap = (a, n) => { if (a.length > n) a.splice(0, a.length - n); };
+addEventListener('mousemove', e => { TRACE.moves.push([Math.round(e.timeStamp * 10) / 10, e.clientX, e.clientY, e.isTrusted ? 1 : 0]); cap(TRACE.moves, 200000); }, opt);
+addEventListener('mousedown', e => TRACE.downs.push([e.timeStamp, e.clientX, e.clientY, e.button, e.isTrusted ? 1 : 0]), opt);
+addEventListener('mouseup', e => TRACE.ups.push([e.timeStamp, e.clientX, e.clientY, e.button]), opt);
+addEventListener('wheel', e => TRACE.wheels.push([e.timeStamp, e.deltaY, e.deltaMode]), opt);
+addEventListener('keydown', e => TRACE.keys.push([e.timeStamp, 'd', e.repeat ? 1 : 0]), opt);
+addEventListener('keyup', e => TRACE.keys.push([e.timeStamp, 'u', 0]), opt);
+addEventListener('scroll', e => { if (e.target === document) { TRACE.scrolls.push([e.timeStamp, scrollY]); cap(TRACE.scrolls, 50000); } }, opt);
+Object.defineProperty(window, '__hearthTrace', { value: () => JSON.parse(JSON.stringify(TRACE)), enumerable: false });
 const isField = t => t && t.matches && t.matches('textarea, input.reply-in');
 const trust = e => { if (e.isTrusted) D.trusted++; else { D.untrusted++; D.untrustedTypes.add(e.type); } if (D.firstInput == null) D.firstInput = e.timeStamp; };
 
@@ -552,12 +568,27 @@ function canvasPrint() {
   x.fillStyle = '#069'; x.fillText('Hearth ✓ 1.234', 2, 15); x.fillStyle = 'rgba(102,204,0,0.7)'; x.fillText('Hearth ✓ 1.234', 4, 17);
   return c.toDataURL();
 }
-function workerNav() {
+/* What a background thread reports. Dedicated and shared workers both, and the
+   GPU as well as the navigator: an automation layer can override the page and
+   miss a worker (Playwright's user agent override does not reach shared
+   workers, and a WebGL patch installed in the page does not exist in any
+   worker). Comparing them is how CreepJS catches it, so the lab does too. */
+const WORKER_SRC = `const report = () => { let gpu = '';
+  try { const gl = new OffscreenCanvas(1, 1).getContext('webgl'); const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+        gpu = gl ? (ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) : ''; } catch (e) {}
+  return { ua: navigator.userAgent, hc: navigator.hardwareConcurrency, lang: (navigator.languages || []).join(','), pf: navigator.platform, gpu }; };
+if (typeof onconnect !== 'undefined' || self.constructor.name === 'SharedWorkerGlobalScope') onconnect = e => e.ports[0].postMessage(report());
+else postMessage(report());`;
+function workerNav(kind = 'dedicated') {
   return new Promise(res => {
-    let w, url; const done = v => { try { w && w.terminate(); url && URL.revokeObjectURL(url); } catch {} res(v); };
+    let w, url; const done = v => { try { w && w.terminate && w.terminate(); w && w.port && w.port.close(); url && URL.revokeObjectURL(url); } catch {} res(v); };
     try {
-      url = URL.createObjectURL(new Blob(['postMessage({ua:navigator.userAgent,hc:navigator.hardwareConcurrency,lang:(navigator.languages||[]).join(","),pf:navigator.platform})'], { type: 'text/javascript' }));
-      w = new Worker(url); w.onmessage = e => done(e.data); w.onerror = () => done(null); setTimeout(() => done(null), 1500);
+      url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
+      if (kind === 'shared') {
+        if (!window.SharedWorker) return done(null);
+        w = new SharedWorker(url); w.port.onmessage = e => done(e.data); w.onerror = () => done(null); w.port.start();
+      } else { w = new Worker(url); w.onmessage = e => done(e.data); w.onerror = () => done(null); }
+      setTimeout(() => done(null), 1500);
     } catch { done(null); }
   });
 }
@@ -640,16 +671,27 @@ async function fingerprintChecks() {
     f.remove();
     add('Frames agree', diffs.length ? 'fail' : 'pass', diffs.length ? 'Fresh frame differs in ' + diffs.join(', ') : 'Fresh frame matches', 40);
   } catch { add('Frames agree', 'skip', 'Could not create a test frame', 0); }
-  const w = await workerNav();
-  if (!w) add('Background thread agrees', 'skip', 'Workers unavailable', 0);
-  else {
+  for (const [kind, label] of [['dedicated', 'Background thread agrees'], ['shared', 'Shared worker agrees']]) {
+    const w = await workerNav(kind);
+    if (!w) { add(label, 'skip', kind === 'shared' ? 'Shared workers unavailable' : 'Workers unavailable', 0); continue; }
     const diffs = [];
-    if (w.ua !== navigator.userAgent) diffs.push('user agent');
+    if (w.ua !== navigator.userAgent) diffs.push('user agent' + (/Headless/i.test(w.ua) ? ' (worker says Headless)' : ''));
     if (w.hc !== navigator.hardwareConcurrency) diffs.push('cores');
     if (w.lang !== langs.join(',')) diffs.push('languages');
     if (w.pf && w.pf !== navigator.platform) diffs.push('platform');
-    add('Background thread agrees', diffs.length ? 'fail' : 'pass', diffs.length ? 'Worker differs in ' + diffs.join(', ') : 'Worker matches', 45);
+    if (w.gpu && rnd && w.gpu !== rnd) diffs.push(`GPU (page: ${rnd}; worker: ${w.gpu})`);
+    add(label, diffs.length ? 'fail' : 'pass', diffs.length ? 'Worker differs in ' + diffs.join(', ') : 'Worker matches' + (w.gpu ? ', GPU included' : ''), 45);
   }
+  // A second opinion from an independent detector: FingerprintJS BotD, vendored
+  // under /vendor/botd (see vendor/README.md).
+  try {
+    const { load } = await import('/vendor/botd/botd.esm.js');
+    const botd = await load();
+    const r = botd.detect();
+    const which = Object.entries(botd.getDetections() || {}).filter(([, d]) => d.bot).map(([k]) => k);
+    add('BotD verdict', r.bot ? 'fail' : 'pass',
+      r.bot ? `BotD says bot (${r.botKind}) via ${which.join(', ') || 'unknown detector'}` : 'FingerprintJS BotD found no automation', 50);
+  } catch (e) { add('BotD verdict', 'skip', 'BotD could not run: ' + (e && e.message || e), 0); }
   return R;
 }
 
@@ -770,6 +812,33 @@ $('#copyRep').addEventListener('click', async () => {
 });
 
 fingerprintChecks().then(r => { FP = r; render(); });
+
+/* Read-out for the behaviour runner: the whole report, without clicking the
+   detail tabs. A runner that clicked them would add its own input to the
+   session it is measuring - and in a manual session that input would not even
+   be the person's. */
+Object.defineProperty(window, '__hearthReport', { enumerable: false, value: () => {
+  render();
+  const rows = (list, group) => (list || []).map(c => ({ state: c.s, name: c.name, detail: c.detail, group }));
+  const row = id => ({ value: $(id).querySelector('.v').textContent.trim(), detail: $(id).querySelector('.sub').textContent.trim() });
+  return {
+    overall: $('#scNum').textContent.trim(), verdict: $('#scVerdict').textContent.trim(),
+    behaviour: row('#rBeh'), fingerprint: row('#rFp'), recaptcha: row('#rRc'),
+    checks: [...rows(BEH, 'beh'), ...rows(FP, 'fp')],
+  };
+} });
+
+/* Manual sessions (?manual=1): a person drives, and says when they are done.
+   The runner waits for this flag; nothing else changes about the page. */
+if (new URLSearchParams(location.search).has('manual')) {
+  const btn = $('#finish');
+  btn.hidden = false;
+  btn.addEventListener('click', () => {
+    Object.defineProperty(window, '__hearthFinished', { value: true, enumerable: false });
+    btn.textContent = 'Finished — collecting results';
+    btn.disabled = true;
+  });
+}
 setInterval(render, 500);
 render();
 

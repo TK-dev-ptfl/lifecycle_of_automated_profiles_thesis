@@ -261,6 +261,11 @@ class Actor:
         observation = await self._resolve(goal, goal.target)
         assert observation.box is not None
         point = _landing_point(observation.box, self.profile.aim_scatter)
+        viewport = self.env.viewport()
+        if not (0 <= point[1] <= viewport.height and 0 <= point[0] <= viewport.width):
+            # Travel is clamped to the viewport, so going ahead would press
+            # whatever sits at the edge instead - a silent misclick.
+            raise GoalFailed(goal, f"{goal.target} is off screen at ({point[0]:.0f}, {point[1]:.0f}); ScrollTo it first")
         size = max(8.0, min(observation.box.width, observation.box.height))
 
         await self._ensure_entered()
@@ -284,6 +289,7 @@ class Actor:
             goal.text,
             words_per_minute=self.profile.typing_wpm,
             typo_chance=self.profile.typo_chance,
+            hold_ms=self.profile.key_hold_ms,
             sleeper=self.env.sleep,
         )
         corrections = sent.count("Backspace")
