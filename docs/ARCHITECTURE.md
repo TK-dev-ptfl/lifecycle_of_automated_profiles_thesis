@@ -3,6 +3,10 @@
 How the thesis's chapter 3 design maps onto the repository. For what is finished
 and what is not, see [STATUS.md](STATUS.md).
 
+## Separate projects
+
+- **`social-lab/`**: a standalone dummy social network for collecting human interaction data (Node, no dependencies). It shares no code with `backend/` or `frontend/`; data moves through exported files. See [social-lab/README.md](../social-lab/README.md).
+
 ## Stack
 
 - **Backend**: FastAPI + SQLAlchemy (async) + Alembic, `backend/app/`. SQLite by default

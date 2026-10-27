@@ -10,6 +10,7 @@
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Ďalší postup, fázy, hypotézy, otvorené rozhodnutia |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Mapa kódu, spustenie, vrstvy a služby |
 | [docs/TEST_ENVIRONMENT.md](docs/TEST_ENVIRONMENT.md) | Meranie ľudskosti algoritmov: čo prostredie meria, prečo je to platné (literatúra, validácia), obmedzenia, protokol experimentu |
+| [social-lab/](social-lab/README.md) | Samostatná dummy sociálna sieť na zber dát o správaní ľudí (so súhlasom): výskumné otázky, slovník dát, analýza, literatúra |
 | [backend/tests/behaviour/test_env/VALIDATION.md](backend/tests/behaviour/test_env/VALIDATION.md) | Kontroly feed labu na nahraných ľuďoch a botoch |
 | [backend/tests/behaviour/test_env/feed-lab/README.md](backend/tests/behaviour/test_env/feed-lab/README.md) | Testovací feed s detektormi |
 | [backend/tests/behaviour/test_env/bot_model/README.md](backend/tests/behaviour/test_env/bot_model/README.md) | Klasifikátor pohybu myši, dáta, tréning ([REPORT](backend/tests/behaviour/test_env/bot_model/REPORT.md)) |

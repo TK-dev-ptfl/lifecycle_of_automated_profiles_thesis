@@ -332,7 +332,7 @@ counts an off-screen element as not visible; Playwright counts it as visible, be
 
 ## 7. Known limitations
 
-- **The human baseline still has to be recorded.** No manual sessions exist yet. The
+- **The human baseline still has to be recorded.** [social-lab/](../social-lab/README.md) is built to collect it at scale, from consenting participants, on a public site. No manual sessions exist yet. The
   algorithm's classifier probability of 0.32 means "below the threshold", not "like
   people in this lab", until there are manual runs to compare against (§8).
 - **Only mouse movement has a trained judge.** Keystrokes, clicks and scrolling are judged

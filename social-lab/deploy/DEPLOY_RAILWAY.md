@@ -112,8 +112,10 @@ prints a long one-line **public key**. Copy that line for step 5.
 1. Sign in at **railway.com** with GitHub.
 2. Choose **New Project → Deploy from GitHub repo**, and allow the Railway GitHub app
    access to the thesis repository.
-3. Pick the repository. Railway creates a service and starts a first build. It may
-   fail until the settings below are in place; that's expected.
+3. Pick the **thesis** repository (`lifecycle_of_automated_profiles_thesis`), not
+   the data repository: Railway never needs access to the data repository, the
+   server writes there only with the token. Railway creates a service and starts a
+   first build. It may fail until the settings below are in place; that's expected.
 4. Open the service. Under **Settings**:
    - **Root Directory:** `/social-lab`
    - **Config file path** (Config-as-code): `/social-lab/railway.json`. This must be
@@ -234,6 +236,7 @@ ciphertext.
 
 | Symptom | Cause and fix |
 |---|---|
+| Build log says *Railpack could not determine how to build the app* and lists only `README.md` | The service is connected to the data repository. Settings → Source → Disconnect, then connect the thesis repository and check Root Directory and Config file path again. |
 | Build fails: "Dockerfile not found" | Root Directory is not `/social-lab`. |
 | Every push redeploys the study | Config file path is not `/social-lab/railway.json`, so the watch paths aren't loaded. |
 | `cannot start: DATA_REPO ... not reachable with this token (HTTP 401)` | Token wrong or expired. Make a new one (step 3) and update the variable. |

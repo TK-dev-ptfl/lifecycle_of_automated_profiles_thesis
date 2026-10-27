@@ -20,9 +20,14 @@ const OAEP = { padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' };
 /** Accepts a PEM, or a PEM encoded as base64 on one line (environment
  *  variables do not hold newlines well). */
 export function readKey(text) {
-  const t = String(text || '').trim();
+  // Forgiving about how the value was pasted into a hosting dashboard:
+  // surrounding quotes, a trailing "# comment", and line breaks or spaces
+  // inside the base64 are all dropped.
+  let t = String(text || '').trim().replace(/^(['"])([\s\S]*)\1$/, '$2').trim();
   if (!t) return null;
-  return t.includes('-----BEGIN') ? t : Buffer.from(t, 'base64').toString('utf8');
+  if (t.includes('-----BEGIN')) return t.replace(/\\n/g, '\n');
+  t = t.replace(/\s#.*$/s, '').replace(/\s+/g, '');
+  return Buffer.from(t, 'base64').toString('utf8');
 }
 
 export function seal(plain, publicKeyPem) {
