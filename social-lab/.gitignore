@@ -1,0 +1,11 @@
+# Collected study data: personal data, never committed.
+data/
+analysis/out/
+.env
+*.pem
+*.key
+*.crt
+node_modules/
+
+# Decrypted copy of the data repository (analysis/decrypt.mjs): personal data.
+data-remote/

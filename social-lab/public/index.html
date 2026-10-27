@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hearth study</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+<script type="module" src="/js/main.js"></script>
+</head>
+<body>
+
+<!-- ============ 1. Information and consent ============ -->
+<main class="doc" data-stage="welcome" hidden>
+  <h1>How do people use a social feed?</h1>
+  <p class="lead">A research study for a master's thesis at <span data-cfg="institution">(institution)</span>.
+    It takes about <b>5–8 minutes</b>.</p>
+
+  <h2>What you will do</h2>
+  <ol>
+    <li>Browse a made-up social network called Hearth for about a minute and a half, the way you normally would.</li>
+    <li>Do six small things: like a few posts, write a comment, write a post, open a profile, follow someone.</li>
+    <li>Answer seven short multiple-choice questions.</li>
+  </ol>
+  <p>Everything on Hearth is invented. Nothing you do is seen by anyone else or posted anywhere.</p>
+
+  <h2>Why</h2>
+  <p>We are studying how people move the mouse, type, scroll and read on social media, so that automated
+    accounts (bots) can be told apart from people. Your session is an example of how a real person behaves.</p>
+
+  <h2>What is recorded</h2>
+  <ul>
+    <li><b>How you use the mouse, keyboard and touch screen</b>: pointer positions and times, clicks, scrolling,
+      and the timing of key presses. <b>Not which keys</b>: only the kind of key (letter, space, backspace, …).</li>
+    <li><b>What you do on Hearth</b>: which posts were on screen and for how long, likes, follows, and the
+      <b>length</b> of anything you write. The text of your comments and posts is <b>not</b> saved.</li>
+    <li><b>Technical details of your browser and device</b>: browser and version, operating system, screen size,
+      graphics card name, language, time zone, number of processor cores, and similar settings.</li>
+    <li><b>Technical details of your connection</b>: how your browser sets up the secure connection, the order of
+      its request headers, and the country and type of network your address belongs to (e.g. home broadband,
+      mobile, data centre). <b>Your IP address is not stored.</b></li>
+    <li id="recaptcha-note" hidden>This site uses <b>Google reCAPTCHA v3</b>, which sends information about your
+      visit to Google. Google's <a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Privacy
+      Policy</a> and <a href="https://policies.google.com/terms" target="_blank" rel="noopener">Terms</a> apply.</li>
+    <li id="webrtc-note" hidden>One connectivity check contacts a Google STUN server. Its result is stored only as
+      yes/no.</li>
+    <li>Your answers to the questions at the end.</li>
+  </ul>
+  <p>We do <b>not</b> collect your name, email, account details, or anything that is shown on other websites.</p>
+
+  <h2>Your rights</h2>
+  <ul>
+    <li>Taking part is voluntary. You can stop at any time with the <b>Stop and delete</b> button, and everything
+      recorded in your session is deleted at once.</li>
+    <li>At the end you get a <b>deletion code</b>. With it you can delete your data later, at the bottom of this page.</li>
+    <li id="storage-github" hidden>Your session is <b>encrypted on the study server</b> as soon as you finish and
+      then stored in a private repository on <b>GitHub</b> (GitHub, Inc., USA). Only the researcher holds the key that
+      can read it; GitHub cannot. Deleting with your code removes it at once; encrypted copies in the repository's
+      version history are purged within 30 days.</li>
+    <li id="storage-local" hidden>Your session is stored only on the researcher's own storage.</li>
+    <li>Data is kept until the thesis is defended and the research is complete (at most 3 years), and is used only
+      for this research. Results are published only as statistics.</li>
+    <li>Questions or requests: <span data-cfg="researcher">the researcher</span>,
+      <a data-cfg="contact" href="#">(contact)</a>.</li>
+  </ul>
+
+  <form id="consent">
+    <label><input type="checkbox"> I am 18 or older.</label>
+    <label><input type="checkbox"> I have read what is recorded and why.</label>
+    <label><input type="checkbox"> I agree to take part, and know I can stop and delete my data at any time.</label>
+    <button type="button" class="pill big" id="start" disabled>Start</button>
+    <p class="error" id="start-error" role="alert"></p>
+  </form>
+
+  <details class="later">
+    <summary>Delete data from an earlier session</summary>
+    <form id="delete-form"><input id="delete-code" placeholder="Deletion code" autocomplete="off" required>
+      <button class="pill quiet">Delete</button><span id="delete-result" role="status"></span></form>
+  </details>
+</main>
+
+<!-- ============ 2. The social network ============ -->
+<div id="app" data-stage="app" hidden>
+  <header class="bar">
+    <div class="bar-in">
+      <div class="brand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3c2 3 5 5 5 9a5 5 0 0 1-10 0c0-2 1-3 2-4 0 2 1 3 2 3 0-3-1-5 1-8z"/></svg>Hearth</div>
+      <input class="search" type="search" placeholder="Search Hearth" aria-label="Search" data-field="search" data-t="search" autocomplete="off">
+      <button class="withdraw" id="withdraw">Stop and delete</button>
+    </div>
+  </header>
+  <div class="layout">
+    <nav class="nav" aria-label="Main">
+      <button aria-current="page" data-t="nav" data-name="home">Home</button>
+      <button data-t="nav" data-name="explore">Explore</button>
+      <button data-t="nav" data-name="notifications">Notifications</button>
+      <button data-t="nav" data-name="messages">Messages</button>
+      <button data-t="nav" data-name="saved">Saved</button>
+    </nav>
+    <main>
+      <section class="card" id="panel" aria-live="polite"></section>
+      <section class="card composer-card" aria-label="New post">
+        <div class="composer"><span class="av" style="--h:255" aria-hidden="true">YO</span>
+          <textarea data-field="composer" data-t="composer" placeholder="What's warming you up today?" aria-label="Write a post" maxlength="1000"></textarea></div>
+        <div class="composer-foot"><button class="pill" data-t="post-btn">Post</button></div>
+      </section>
+      <div class="feed" id="feed"></div>
+      <div class="loading" id="sentinel">Loading more posts…</div>
+    </main>
+    <aside class="side">
+      <section class="card"><h2>Trending</h2><div id="trends"></div></section>
+      <section class="card"><h2>Who to follow</h2><div id="who"></div></section>
+    </aside>
+  </div>
+  <aside class="overlay" id="profile" hidden>
+    <div class="sheet card"><button class="pill quiet close" data-t="profile-close">Back to feed</button><div class="profile-body"></div></div>
+  </aside>
+  <div class="toast" id="toast" role="status"></div>
+</div>
+
+<!-- ============ 3. Questionnaire ============ -->
+<main class="doc" data-stage="survey" hidden>
+  <h1>Almost done: seven questions</h1>
+  <p>These help interpret the data (a trackpad moves differently from a mouse, for example). All are optional.</p>
+  <form id="survey-form">
+    <fieldset><legend>1. What did you use to move the pointer?</legend>
+      <label><input type="radio" name="device" value="mouse"> Mouse</label>
+      <label><input type="radio" name="device" value="touchpad"> Touchpad / trackpad</label>
+      <label><input type="radio" name="device" value="touchscreen"> Touch screen (phone or tablet)</label>
+      <label><input type="radio" name="device" value="other"> Something else (trackball, pen, …)</label></fieldset>
+    <fieldset><legend>2. Which hand did you use for it?</legend>
+      <label><input type="radio" name="hand" value="right"> Right</label>
+      <label><input type="radio" name="hand" value="left"> Left</label></fieldset>
+    <fieldset><legend>3. How did you type?</legend>
+      <label><input type="radio" name="typing" value="touch"> Without looking at the keys (touch typing)</label>
+      <label><input type="radio" name="typing" value="look"> Looking at the keys</label>
+      <label><input type="radio" name="typing" value="screen"> On-screen keyboard</label></fieldset>
+    <fieldset><legend>4. Is English your first language?</legend>
+      <label><input type="radio" name="english" value="yes"> Yes</label>
+      <label><input type="radio" name="english" value="no"> No</label></fieldset>
+    <fieldset><legend>5. Your age</legend>
+      <select name="age"><option value="">Prefer not to say</option><option>18-24</option><option>25-34</option><option>35-44</option><option>45-54</option><option>55-64</option><option>65+</option></select></fieldset>
+    <fieldset><legend>6. How much time do you spend on social media on a typical day?</legend>
+      <select name="social"><option value="">Prefer not to say</option><option>none</option><option>under 30 min</option><option>30-60 min</option><option>1-2 h</option><option>2-4 h</option><option>over 4 h</option></select></fieldset>
+    <fieldset><legend>7. Did you browse Hearth the way you normally browse social media?</legend>
+      <div class="scale"><span>Not at all</span>
+        <label><input type="radio" name="natural" value="1">1</label><label><input type="radio" name="natural" value="2">2</label>
+        <label><input type="radio" name="natural" value="3">3</label><label><input type="radio" name="natural" value="4">4</label>
+        <label><input type="radio" name="natural" value="5">5</label><span>Exactly</span></div></fieldset>
+    <button class="pill big">Submit</button>
+  </form>
+</main>
+
+<!-- ============ 4. Debrief ============ -->
+<main class="doc" data-stage="debrief" hidden>
+  <h1>Thank you</h1>
+  <p>Your deletion code: <b class="code" id="code"></b></p>
+  <p>Keep it if you might want your data deleted later: enter it at the bottom of this site's start page, or send it
+    to <a data-cfg="contact" href="#">(contact)</a>.</p>
+  <h2>What this was about</h2>
+  <p>Bots on social networks increasingly imitate people. The usual tells (perfectly straight mouse movements,
+    identical pauses, typing with no rhythm, reading posts faster than anyone can read) only work if we know what real
+    people do. Your session adds one real example: how long you looked at posts of different lengths, how your
+    pointer accelerated and slowed down near a button, how long you held each key, how you scrolled. Together with
+    sessions from other people it shows the range of normal behaviour, which is what both detectors and the study's
+    own measurements are checked against.</p>
+  <p>You can close this page.</p>
+</main>
+
+<main class="doc" data-stage="withdrawn" hidden>
+  <h1>Stopped</h1>
+  <p>Everything recorded in this session has been deleted. Thank you for your time.</p>
+</main>
+
+<footer class="foot">Research study. <a data-cfg="contact" href="#">Contact</a></footer>
+</body>
+</html>

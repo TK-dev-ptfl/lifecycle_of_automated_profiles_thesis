@@ -1,0 +1,8 @@
+data/
+data-remote/
+analysis/out/
+.env
+*.pem
+*.key
+*.crt
+deploy/
